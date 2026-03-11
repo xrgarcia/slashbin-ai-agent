@@ -57,14 +57,17 @@ Each poll cycle:
 
 The daemon filters out its own comments and reviews when checking for new feedback. It identifies itself via `gh api user` (the authenticated gh user). This prevents the daemon from responding to its own ACK/completion comments.
 
-### State (in-memory, lost on restart)
+### State (persisted to disk)
 
-- `implemented` — set of issue numbers already implemented this session
+All durable state is saved to `.agent-state.json` in the daemon's directory (not the target repo). This file is written after every state change and loaded on startup, so the daemon survives restarts.
+
+**Persisted:**
+- `implemented` — set of issue numbers already implemented
 - `failed` — map of issue numbers to failure count + last error
 - `trackedPRs` — map of PR numbers to revision state (count, last addressed IDs, status)
-- `implementing` / `revising` — mutex, only one operation at a time
 
-On restart, the daemon loses track of its PRs. It will re-discover new `approved` issues but won't resume watching existing PRs. This is acceptable for v1.
+**Transient (in-memory only):**
+- `implementing` / `revising` — mutex, only one operation at a time. Reset on restart (safe — the daemon just picks up where it left off next cycle).
 
 ## Architecture
 
@@ -76,6 +79,7 @@ src/
 ├── github.ts        # GitHub polling via gh CLI (issues + PR reviews)
 ├── agent.ts         # Spawns claude CLI (implement + revise)
 ├── reviewer.ts      # PR tracking state machine (watch/revise/approved/abandoned)
+├── state.ts         # Disk persistence (.agent-state.json)
 ├── orchestrator.ts  # Priority-aware cycle: revisions > new implementations
 ├── daemon.ts        # Poll loop + graceful shutdown
 └── index.ts         # Public API exports
@@ -94,3 +98,4 @@ src/
 - **One at a time** — never runs two Claude instances concurrently (resource + git state safety)
 - **Revisions > new work** — always address reviewer feedback before picking up new issues
 - **Daemon manager** — `agent-manager.mjs` provides start/stop/restart/status/logs with PID tracking (same pattern as slashbin-discord-bot)
+- **Disk persistence** — `.agent-state.json` survives restarts; daemon resumes watching existing PRs and skips already-implemented issues

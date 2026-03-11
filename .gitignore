@@ -3,4 +3,5 @@ dist/
 .env
 *.tgz
 .agent.pid
+.agent-state.json
 agent.log

@@ -10,6 +10,7 @@ import {
   getReviewerState,
   type ReviewerState,
 } from "./reviewer.js";
+import { loadState, saveState, setStatePath } from "./state.js";
 
 interface FailedIssue {
   count: number;
@@ -28,11 +29,32 @@ const MAX_RETRIES = 2;
 
 let implementing: number | null = null;
 let revising: number | null = null;
-const implemented = new Set<number>();
-const failed = new Map<number, FailedIssue>();
+let _implemented: Set<number> | null = null;
+let _failed: Map<number, FailedIssue> | null = null;
 let abortController: AbortController | null = null;
 
+function ensureLoaded(): { implemented: Set<number>; failed: Map<number, FailedIssue> } {
+  if (_implemented && _failed) return { implemented: _implemented, failed: _failed };
+  const state = loadState();
+  _implemented = new Set(state.implemented);
+  _failed = new Map(Object.entries(state.failed).map(([k, v]) => [Number(k), v]));
+  return { implemented: _implemented, failed: _failed };
+}
+
+function persist(): void {
+  const { implemented, failed } = ensureLoaded();
+  const state = loadState();
+  state.implemented = [...implemented];
+  state.failed = Object.fromEntries(failed);
+  saveState(state);
+}
+
+export function initState(repoPath: string): void {
+  setStatePath(repoPath);
+}
+
 export function getState(): OrchestratorState {
+  const { implemented, failed } = ensureLoaded();
   return {
     implementing,
     revising,
@@ -52,6 +74,7 @@ export async function runCycle(
   cycleNumber: number
 ): Promise<ImplementationResult | null> {
   const cycleLogger = logger.child({ cycle: cycleNumber, phase: "poll" });
+  const { implemented, failed } = ensureLoaded();
 
   if (implementing !== null || revising !== null) {
     cycleLogger.info(
@@ -81,7 +104,6 @@ export async function runCycle(
     revLogger.info(`Revising PR #${task.prNumber} for issue #${task.issueNumber}`);
 
     try {
-      // ACK the review
       commentOnPR(
         repo,
         task.prNumber,
@@ -111,7 +133,6 @@ export async function runCycle(
         revLogger.warn(`Revision of PR #${task.prNumber} failed: ${result.error}`);
       }
 
-      // Check if max revisions reached after this attempt
       const { tracked } = getReviewerState();
       const pr = tracked.find((p) => p.prNumber === task.prNumber);
       if (pr?.status === "abandoned") {
@@ -166,11 +187,11 @@ export async function runCycle(
     if (result.success) {
       implemented.add(issue.number);
       failed.delete(issue.number);
+      persist();
       implLogger.info(`Successfully implemented #${issue.number}`, {
         prUrl: result.prUrl,
       });
 
-      // Track the PR for revision monitoring
       if (result.prUrl) {
         const prMatch = result.prUrl.match(/\/pull\/(\d+)/);
         if (prMatch) {
@@ -185,6 +206,7 @@ export async function runCycle(
         count: (existing?.count ?? 0) + 1,
         lastError: result.error ?? "unknown",
       });
+      persist();
       implLogger.warn(`Failed to implement #${issue.number}: ${result.error}`);
     }
 

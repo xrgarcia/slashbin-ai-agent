@@ -7,6 +7,7 @@ import {
   isPROpen,
   type PRReviewFeedback,
 } from "./github.js";
+import { loadState, saveState } from "./state.js";
 
 export interface TrackedPR {
   prNumber: number;
@@ -23,9 +24,26 @@ export interface ReviewerState {
   revising: number | null;
 }
 
-const trackedPRs = new Map<number, TrackedPR>();
+let trackedPRs = new Map<number, TrackedPR>();
+let initialized = false;
+
+function ensureLoaded(): void {
+  if (initialized) return;
+  const state = loadState();
+  for (const [key, pr] of Object.entries(state.trackedPRs)) {
+    trackedPRs.set(Number(key), pr);
+  }
+  initialized = true;
+}
+
+function persist(): void {
+  const state = loadState();
+  state.trackedPRs = Object.fromEntries(trackedPRs);
+  saveState(state);
+}
 
 export function trackPR(prNumber: number, issueNumber: number, repo: string): void {
+  ensureLoaded();
   trackedPRs.set(prNumber, {
     prNumber,
     issueNumber,
@@ -35,13 +53,16 @@ export function trackPR(prNumber: number, issueNumber: number, repo: string): vo
     lastAddressedCommentId: 0,
     status: "watching",
   });
+  persist();
 }
 
 export function getTrackedPRs(): Map<number, TrackedPR> {
+  ensureLoaded();
   return trackedPRs;
 }
 
 export function getReviewerState(): ReviewerState {
+  ensureLoaded();
   const tracked = [...trackedPRs.values()].map((pr) => ({
     prNumber: pr.prNumber,
     issueNumber: pr.issueNumber,
@@ -53,8 +74,12 @@ export function getReviewerState(): ReviewerState {
 }
 
 export function markRevisionStarted(prNumber: number): void {
+  ensureLoaded();
   const pr = trackedPRs.get(prNumber);
-  if (pr) pr.status = "revising";
+  if (pr) {
+    pr.status = "revising";
+    persist();
+  }
 }
 
 export function markRevisionComplete(
@@ -63,17 +88,23 @@ export function markRevisionComplete(
   lastCommentId: number,
   maxAttempts: number
 ): void {
+  ensureLoaded();
   const pr = trackedPRs.get(prNumber);
   if (!pr) return;
   pr.revisionCount++;
   pr.lastAddressedReviewId = lastReviewId;
   pr.lastAddressedCommentId = lastCommentId;
   pr.status = pr.revisionCount >= maxAttempts ? "abandoned" : "watching";
+  persist();
 }
 
 export function markApproved(prNumber: number): void {
+  ensureLoaded();
   const pr = trackedPRs.get(prNumber);
-  if (pr) pr.status = "approved";
+  if (pr) {
+    pr.status = "approved";
+    persist();
+  }
 }
 
 function formatFeedback(feedback: PRReviewFeedback): string {
@@ -104,24 +135,29 @@ export function findNextRevision(
   config: AgentConfig,
   logger: Logger
 ): { task: RevisionTask; maxIds: { reviewId: number; commentId: number } } | null {
+  ensureLoaded();
   const repo = config.githubRepo!;
   const cwd = config.repoPath;
 
   // Clean up: remove closed/merged PRs and check for approvals
+  let changed = false;
   for (const [prNumber, pr] of trackedPRs) {
     if (pr.status === "approved" || pr.status === "abandoned") continue;
 
     if (!isPROpen(repo, prNumber, cwd)) {
       logger.debug(`PR #${prNumber} is no longer open, removing from tracking`);
       trackedPRs.delete(prNumber);
+      changed = true;
       continue;
     }
 
     if (isPRApproved(repo, prNumber, cwd)) {
       logger.info(`PR #${prNumber} approved`);
       markApproved(prNumber);
+      changed = true;
     }
   }
+  if (changed) persist();
 
   // Get PRs that are watching and under the revision limit
   const watching = [...trackedPRs.values()].filter((pr) => pr.status === "watching");
@@ -146,7 +182,6 @@ export function findNextRevision(
 
   if (feedbacks.length === 0) return null;
 
-  // Pick the first one (oldest PR)
   const feedback = feedbacks[0];
   const pr = trackedPRs.get(feedback.prNumber)!;
   const maxIds = getMaxIds(feedback);
