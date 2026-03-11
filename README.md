@@ -50,6 +50,7 @@ npm run dev        # Watch mode (tsx, auto-reload on source changes)
 
 Files created at runtime:
 - `.agent.pid` — PID of the background process
+- `.agent-state.json` — persisted state (implemented issues, tracked PRs, failures). Survives restarts.
 - `agent.log` — stdout/stderr log (appended)
 
 ## Configuration
