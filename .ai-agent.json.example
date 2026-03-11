@@ -1,0 +1,12 @@
+{
+  "repoPath": ".",
+  "githubRepo": "owner/repo",
+  "triggerLabel": "approved",
+  "pollIntervalMs": 300000,
+  "baseBranch": "develop",
+  "featureBranch": "features",
+  "maxTurns": 30,
+  "maxDurationMs": 1800000,
+  "logFormat": "text",
+  "logLevel": "info"
+}
