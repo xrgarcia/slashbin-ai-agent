@@ -17,23 +17,40 @@ Poll GitHub → Find approved issues → Implement with Claude → Create PR →
 ## Quick Start
 
 ```bash
-# 1. Install
-npm install -g slashbin-ai-agent
+# 1. Clone and install
+git clone <repo-url>
+cd slashbin-ai-agent
+npm install && npm run build
 
-# 2. Set required env vars
+# 2. Configure (copy .env.example or set env vars)
 export GITHUB_TOKEN=ghp_...
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# 3. Run from your repo directory
-cd /path/to/your/repo
-slashbin-ai-agent
+# 3. Start the daemon (background)
+npm start
 ```
 
-Or with npx (zero install):
+## Daemon Management
+
+The agent runs as a background daemon managed by `agent-manager.mjs` (PID file + log file, same pattern as `slashbin-discord-bot`).
 
 ```bash
-GITHUB_TOKEN=ghp_... ANTHROPIC_API_KEY=sk-ant-... npx slashbin-ai-agent
+npm start          # Start daemon in background
+npm stop           # Graceful stop (waits for in-progress work, up to 65s)
+npm restart        # Stop + start
+npm run status     # Show running state, uptime, recent logs
+npm run logs       # Show last 30 lines of agent.log
+npm run logs -- 100 # Show last 100 lines
+
+# Foreground / one-shot (useful for debugging)
+npm run start:fg   # Run in foreground (ctrl+c to stop)
+npm run once       # Run one poll cycle and exit
+npm run dev        # Watch mode (tsx, auto-reload on source changes)
 ```
+
+Files created at runtime:
+- `.agent.pid` — PID of the background process
+- `agent.log` — stdout/stderr log (appended)
 
 ## Configuration
 
@@ -64,14 +81,14 @@ The prompt supports these placeholders:
 - `{{issue_title}}` — Issue title
 - `{{issue_body}}` — Issue body (markdown)
 
-## CLI Usage
+## CLI Usage (direct)
 
 ```bash
-slashbin-ai-agent                    # Start daemon (polls continuously)
-slashbin-ai-agent --once             # Run one cycle and exit
-slashbin-ai-agent --config path.json # Use specific config file
-slashbin-ai-agent --version          # Print version
-slashbin-ai-agent --help             # Show help
+node dist/cli.js                     # Start in foreground (polls continuously)
+node dist/cli.js --once              # Run one cycle and exit
+node dist/cli.js --config path.json  # Use specific config file
+node dist/cli.js --version           # Print version
+node dist/cli.js --help              # Show help
 ```
 
 ## Using with Skills

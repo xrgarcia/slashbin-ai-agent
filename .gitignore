@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 *.tgz
+.agent.pid
+agent.log

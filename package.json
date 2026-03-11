@@ -13,7 +13,13 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/cli.ts",
-    "start": "node dist/cli.js",
+    "start": "node agent-manager.mjs start",
+    "stop": "node agent-manager.mjs stop",
+    "restart": "node agent-manager.mjs restart",
+    "status": "node agent-manager.mjs status",
+    "logs": "node agent-manager.mjs logs",
+    "start:fg": "node dist/cli.js",
+    "once": "node dist/cli.js --once",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
