@@ -6,7 +6,6 @@ import { execSync } from "node:child_process";
 const configSchema = z.object({
   repoPath: z.string().default("."),
   githubRepo: z.string().optional(),
-  githubToken: z.string().min(1, "githubToken (GITHUB_TOKEN) is required"),
   triggerLabel: z.string().default("approved"),
   pollIntervalMs: z.coerce.number().int().positive().default(300_000),
   skillPath: z.string().optional(),
@@ -55,7 +54,6 @@ export function loadConfig(configPath?: string): AgentConfig {
   const merged = {
     repoPath: process.env.AI_AGENT_REPO_PATH ?? fileConfig.repoPath,
     githubRepo: process.env.AI_AGENT_GITHUB_REPO ?? fileConfig.githubRepo,
-    githubToken: process.env.GITHUB_TOKEN ?? fileConfig.githubToken,
     triggerLabel: process.env.AI_AGENT_TRIGGER_LABEL ?? fileConfig.triggerLabel,
     pollIntervalMs: process.env.AI_AGENT_POLL_INTERVAL_MS ?? fileConfig.pollIntervalMs,
     skillPath: process.env.AI_AGENT_SKILL_PATH ?? fileConfig.skillPath,

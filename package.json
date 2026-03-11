@@ -30,7 +30,6 @@
     "access": "public"
   },
   "dependencies": {
-    "@octokit/rest": "^21.0.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {

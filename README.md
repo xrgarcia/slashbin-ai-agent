@@ -22,8 +22,9 @@ git clone <repo-url>
 cd slashbin-ai-agent
 npm install && npm run build
 
-# 2. Configure — only GITHUB_TOKEN needed (Claude CLI uses your subscription)
-export GITHUB_TOKEN=ghp_...
+# 2. Ensure claude and gh CLIs are installed and authenticated
+claude --version
+gh auth status
 
 # 3. Start the daemon (background)
 npm start
@@ -59,7 +60,6 @@ Create `.ai-agent.json` in your repo root, or use environment variables. Env var
 |---|---|---|---|
 | `repoPath` | `AI_AGENT_REPO_PATH` | `.` | Path to local repo clone |
 | `githubRepo` | `AI_AGENT_GITHUB_REPO` | *(from git remote)* | GitHub `owner/repo` |
-| `githubToken` | `GITHUB_TOKEN` | **required** | GitHub PAT |
 | `triggerLabel` | `AI_AGENT_TRIGGER_LABEL` | `approved` | Label that triggers implementation |
 | `pollIntervalMs` | `AI_AGENT_POLL_INTERVAL_MS` | `300000` (5 min) | Poll interval in milliseconds |
 | `skillPath` | `AI_AGENT_SKILL_PATH` | — | Path to a Claude Code skill file |
@@ -122,7 +122,7 @@ src/
 ├── cli.ts           # CLI entry point
 ├── config.ts        # Configuration loading + Zod validation
 ├── logger.ts        # Structured logging (JSON/text)
-├── github.ts        # GitHub polling (find actionable issues)
+├── github.ts        # GitHub polling via gh CLI
 ├── agent.ts         # Claude Code CLI spawner
 ├── orchestrator.ts  # Concurrency control + state tracking
 ├── daemon.ts        # Poll loop + graceful shutdown

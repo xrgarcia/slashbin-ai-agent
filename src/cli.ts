@@ -31,10 +31,9 @@ Options:
   --version        Print version and exit
   --help           Show this help message
 
-Requires: Claude Code CLI installed and authenticated (uses your subscription).
+Requires: Claude Code CLI and GitHub CLI (gh) installed and authenticated.
 
 Environment variables:
-  GITHUB_TOKEN              GitHub personal access token (required)
   AI_AGENT_REPO_PATH        Path to local repo clone (default: .)
   AI_AGENT_GITHUB_REPO      GitHub repo owner/name
   AI_AGENT_TRIGGER_LABEL    Trigger label (default: approved)

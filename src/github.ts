@@ -1,4 +1,4 @@
-import { Octokit } from "@octokit/rest";
+import { execFileSync } from "node:child_process";
 import type { AgentConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 
@@ -10,44 +10,50 @@ export interface ActionableIssue {
   url: string;
 }
 
+interface GhIssue {
+  number: number;
+  title: string;
+  body: string;
+  labels: { name: string }[];
+  url: string;
+}
+
+function gh(args: string[], cwd: string): string {
+  return execFileSync("gh", args, {
+    cwd,
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 30_000,
+  }).trim();
+}
+
 export async function findActionableIssues(
   config: AgentConfig,
   logger: Logger
 ): Promise<ActionableIssue[]> {
-  const [owner, repo] = config.githubRepo!.split("/");
-  const octokit = new Octokit({ auth: config.githubToken });
+  const repo = config.githubRepo!;
 
   try {
-    // Paginate all open issues with trigger label
-    const issues = await octokit.paginate(octokit.issues.listForRepo, {
-      owner,
-      repo,
-      state: "open",
-      labels: config.triggerLabel,
-      per_page: 100,
-    });
+    const json = gh([
+      "issue", "list",
+      "--repo", repo,
+      "--state", "open",
+      "--label", config.triggerLabel,
+      "--json", "number,title,body,labels,url",
+      "--limit", "100",
+    ], config.repoPath);
 
-    // Check rate limit
-    const rateLimit = await octokit.rateLimit.get();
-    const remaining = rateLimit.data.rate.remaining;
-    if (remaining < 100) {
-      logger.warn("GitHub API rate limit low", { remaining });
-    }
-
+    const issues: GhIssue[] = JSON.parse(json || "[]");
     const actionable: ActionableIssue[] = [];
 
     for (const issue of issues) {
-      // Skip pull requests (GitHub API returns PRs as issues)
-      if (issue.pull_request) continue;
+      const labels = issue.labels.map((l) => l.name);
 
       // Skip blocked issues
-      const labels = issue.labels
-        .map((l) => (typeof l === "string" ? l : l.name ?? ""))
-        .filter(Boolean);
       if (labels.includes("blocked")) continue;
 
-      // Check for linked PRs via timeline events
-      const hasLinkedPR = await checkForLinkedPR(octokit, owner, repo, issue.number, logger);
+      // Check for linked open PRs
+      const hasLinkedPR = checkForLinkedPR(repo, issue.number, config.repoPath, logger);
       if (hasLinkedPR) {
         logger.debug(`Skipping #${issue.number} — has linked PR`);
         continue;
@@ -58,11 +64,11 @@ export async function findActionableIssues(
         title: issue.title,
         body: issue.body ?? "",
         labels,
-        url: issue.html_url,
+        url: issue.url,
       });
     }
 
-    // Sort oldest first (FIFO)
+    // Sort oldest first (highest issue number = newest, so sort ascending)
     actionable.sort((a, b) => a.number - b.number);
 
     return actionable;
@@ -74,38 +80,27 @@ export async function findActionableIssues(
   }
 }
 
-async function checkForLinkedPR(
-  octokit: Octokit,
-  owner: string,
+function checkForLinkedPR(
   repo: string,
   issueNumber: number,
+  cwd: string,
   logger: Logger
-): Promise<boolean> {
+): boolean {
   try {
-    const events = await octokit.paginate(octokit.issues.listEventsForTimeline, {
-      owner,
-      repo,
-      issue_number: issueNumber,
-      per_page: 100,
-    });
+    // Search for open PRs that mention this issue
+    const json = gh([
+      "pr", "list",
+      "--repo", repo,
+      "--state", "open",
+      "--search", `${issueNumber} in:body`,
+      "--json", "number",
+      "--limit", "5",
+    ], cwd);
 
-    for (const event of events) {
-      if (
-        event.event === "cross-referenced" &&
-        (event as Record<string, unknown>).source
-      ) {
-        const source = (event as Record<string, unknown>).source as Record<string, unknown>;
-        const sourceIssue = source?.issue as Record<string, unknown> | undefined;
-        if (sourceIssue?.pull_request) {
-          // Check if PR is open (not closed/merged PRs)
-          const prState = sourceIssue.state as string;
-          if (prState === "open") return true;
-        }
-      }
-    }
-    return false;
+    const prs = JSON.parse(json || "[]");
+    return prs.length > 0;
   } catch (err) {
-    logger.debug(`Failed to check timeline for #${issueNumber}`, {
+    logger.debug(`Failed to check PRs for #${issueNumber}`, {
       error: err instanceof Error ? err.message : String(err),
     });
     return false;

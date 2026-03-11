@@ -85,15 +85,9 @@ export async function implementIssue(
       abortSignal.addEventListener("abort", onAbort, { once: true });
     }
 
-    const env: Record<string, string> = {
-      ...process.env as Record<string, string>,
-      GITHUB_TOKEN: config.githubToken,
-    };
-    if (process.env.NPM_TOKEN) env.NPM_TOKEN = process.env.NPM_TOKEN;
-
     child = spawn("claude", args, {
       cwd: config.repoPath,
-      env,
+      env: process.env as Record<string, string>,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
