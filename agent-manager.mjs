@@ -5,11 +5,19 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PID_FILE = join(__dirname, ".agent.pid");
-const LOG_FILE = join(__dirname, "agent.log");
 const ENTRY_POINT = join(__dirname, "dist", "cli.js");
 
-const command = process.argv[2];
+// Parse command and --repo flag
+const args = process.argv.slice(2);
+const command = args[0];
+const repoIdx = args.indexOf("--repo");
+const repoName = repoIdx !== -1 ? args[repoIdx + 1] : null;
+
+// Namespace PID/log files by repo name for per-repo daemon mode
+const suffix = repoName ? `-${repoName}` : "";
+const PID_FILE = join(__dirname, `.agent${suffix}.pid`);
+const LOG_FILE = join(__dirname, `agent${suffix}.log`);
+
 const isWindows = process.platform === "win32";
 
 function readPid() {
@@ -41,7 +49,7 @@ function cleanPid() {
 function start() {
   const pid = readPid();
   if (isRunning(pid)) {
-    console.log(`Agent is already running (PID ${pid})`);
+    console.log(`Agent${repoName ? ` (${repoName})` : ""} is already running (PID ${pid})`);
     process.exit(1);
   }
   cleanPid();
@@ -51,8 +59,14 @@ function start() {
     process.exit(1);
   }
 
+  // Pass --repo flag through to the CLI
+  const cliArgs = [ENTRY_POINT];
+  if (repoName) {
+    cliArgs.push("--repo", repoName);
+  }
+
   const logFd = openSync(LOG_FILE, "a");
-  const child = spawn(process.execPath, [ENTRY_POINT], {
+  const child = spawn(process.execPath, cliArgs, {
     cwd: __dirname,
     stdio: ["ignore", logFd, logFd],
     detached: !isWindows,
@@ -66,10 +80,10 @@ function start() {
   // Wait briefly and confirm the process is still alive
   setTimeout(() => {
     if (isRunning(child.pid)) {
-      console.log(`Agent started (PID ${child.pid})`);
+      console.log(`Agent${repoName ? ` (${repoName})` : ""} started (PID ${child.pid})`);
       console.log(`Logs: ${LOG_FILE}`);
     } else {
-      console.error("Agent failed to start. Check agent.log for details.");
+      console.error("Agent failed to start. Check logs for details.");
       cleanPid();
       process.exit(1);
     }
@@ -80,12 +94,12 @@ function start() {
 function stop() {
   const pid = readPid();
   if (!isRunning(pid)) {
-    console.log("Agent is not running");
+    console.log(`Agent${repoName ? ` (${repoName})` : ""} is not running`);
     cleanPid();
     return;
   }
 
-  console.log(`Stopping agent (PID ${pid})...`);
+  console.log(`Stopping agent${repoName ? ` (${repoName})` : ""} (PID ${pid})...`);
   try {
     if (isWindows) {
       execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" });
@@ -138,7 +152,7 @@ function restart() {
 function status() {
   const pid = readPid();
   if (isRunning(pid)) {
-    console.log(`Agent is running (PID ${pid})`);
+    console.log(`Agent${repoName ? ` (${repoName})` : ""} is running (PID ${pid})`);
 
     // Show uptime on Linux
     if (!isWindows) {
@@ -165,7 +179,7 @@ function status() {
       tail.forEach((l) => console.log(`  ${l}`));
     } catch { /* no log file */ }
   } else {
-    console.log("Agent is not running");
+    console.log(`Agent${repoName ? ` (${repoName})` : ""} is not running`);
     if (pid) {
       console.log(`(stale PID file referenced ${pid})`);
       cleanPid();
@@ -174,7 +188,7 @@ function status() {
 }
 
 function logs() {
-  const lines = parseInt(process.argv[3], 10) || 30;
+  const lines = parseInt(args[1], 10) || 30;
   try {
     const log = readFileSync(LOG_FILE, "utf8").trim().split("\n");
     log.slice(-lines).forEach((l) => console.log(l));
@@ -200,13 +214,17 @@ switch (command) {
     logs();
     break;
   default:
-    console.log(`Usage: node agent-manager.mjs <command>
+    console.log(`Usage: node agent-manager.mjs <command> [--repo <name>]
 
 Commands:
   start     Start the agent daemon in the background
   stop      Stop the running agent gracefully (waits for in-progress work)
   restart   Stop and start the agent
   status    Show whether the agent is running + recent logs
-  logs [N]  Show last N lines of agent.log (default: 30)`);
+  logs [N]  Show last N lines of agent log (default: 30)
+
+Options:
+  --repo <name>  Target a specific repo (uses namespaced PID/log files)
+                 Enables running one daemon per repo simultaneously`);
     process.exit(command ? 1 : 0);
 }

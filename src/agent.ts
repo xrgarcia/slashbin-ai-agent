@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import type { AgentConfig } from "./config.js";
+import type { RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import type { ActionableIssue } from "./github.js";
 
@@ -42,7 +42,7 @@ const DEFAULT_PROMPT = `You have been assigned to implement GitHub issue #{{issu
 
 Work autonomously. Do not ask questions — make reasonable decisions and proceed.`;
 
-function buildPrompt(issue: ActionableIssue, config: AgentConfig): string {
+function buildPrompt(issue: ActionableIssue, config: RepoConfig): string {
   const template = config.prompt ?? DEFAULT_PROMPT;
   return template
     .replace(/\{\{issue_number\}\}/g, String(issue.number))
@@ -52,7 +52,7 @@ function buildPrompt(issue: ActionableIssue, config: AgentConfig): string {
 
 function spawnClaude(
   prompt: string,
-  config: AgentConfig,
+  config: RepoConfig,
   logger: Logger,
   abortSignal?: AbortSignal
 ): Promise<SpawnResult> {
@@ -127,7 +127,7 @@ function spawnClaude(
 
 export async function implementIssue(
   issue: ActionableIssue,
-  config: AgentConfig,
+  config: RepoConfig,
   logger: Logger,
   abortSignal?: AbortSignal
 ): Promise<ImplementationResult> {
@@ -166,7 +166,7 @@ export async function implementIssue(
 
 export async function reviseForPR(
   task: RevisionTask,
-  config: AgentConfig,
+  config: RepoConfig,
   logger: Logger,
   abortSignal?: AbortSignal
 ): Promise<RevisionResult> {

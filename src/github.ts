@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import type { AgentConfig } from "./config.js";
+import type { RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 
 export interface ActionableIssue {
@@ -28,10 +28,10 @@ function gh(args: string[], cwd: string): string {
 }
 
 export async function findActionableIssues(
-  config: AgentConfig,
+  config: RepoConfig,
   logger: Logger
 ): Promise<ActionableIssue[]> {
-  const repo = config.githubRepo!;
+  const repo = config.githubRepo;
 
   try {
     const json = gh([

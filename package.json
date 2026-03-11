@@ -18,6 +18,10 @@
     "restart": "node agent-manager.mjs restart",
     "status": "node agent-manager.mjs status",
     "logs": "node agent-manager.mjs logs",
+    "start:repo": "node agent-manager.mjs start --repo",
+    "stop:repo": "node agent-manager.mjs stop --repo",
+    "status:repo": "node agent-manager.mjs status --repo",
+    "logs:repo": "node agent-manager.mjs logs --repo",
     "start:fg": "node dist/cli.js",
     "once": "node dist/cli.js --once",
     "typecheck": "tsc --noEmit"

@@ -3,15 +3,34 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { execSync } from "node:child_process";
 
+// --- Schemas ---
+
+const repoEntrySchema = z.object({
+  name: z.string(),
+  repoPath: z.string(),
+  githubRepo: z.string().optional(),
+  triggerLabel: z.string().optional(),
+  baseBranch: z.string().optional(),
+  featureBranch: z.string().optional(),
+  skillPath: z.string().optional(),
+  prompt: z.string().optional(),
+});
+
 const configSchema = z.object({
+  // Single-repo fields (backward compat — ignored when repos[] is provided)
   repoPath: z.string().default("."),
   githubRepo: z.string().optional(),
   triggerLabel: z.string().default("approved"),
-  pollIntervalMs: z.coerce.number().int().positive().default(300_000),
-  skillPath: z.string().optional(),
-  prompt: z.string().optional(),
   baseBranch: z.string().default("develop"),
   featureBranch: z.string().default("features"),
+  skillPath: z.string().optional(),
+  prompt: z.string().optional(),
+
+  // Multi-repo
+  repos: z.array(repoEntrySchema).optional(),
+
+  // Global settings
+  pollIntervalMs: z.coerce.number().int().positive().default(300_000),
   maxTurns: z.coerce.number().int().positive().default(30),
   maxDurationMs: z.coerce.number().int().positive().default(1_800_000),
   maxRevisionAttempts: z.coerce.number().int().positive().default(3),
@@ -20,7 +39,40 @@ const configSchema = z.object({
   logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
 
-export type AgentConfig = z.infer<typeof configSchema>;
+// --- Types ---
+
+/**
+ * Fully resolved per-repo config. Contains both repo-specific settings and
+ * global settings, so downstream functions only need this one type.
+ * This is also the unit of work — one daemon per repo just uses one RepoConfig.
+ */
+export interface RepoConfig {
+  name: string;
+  repoPath: string;
+  githubRepo: string;
+  triggerLabel: string;
+  baseBranch: string;
+  featureBranch: string;
+  skillPath?: string;
+  prompt?: string;
+  maxTurns: number;
+  maxDurationMs: number;
+  maxRevisionAttempts: number;
+  allowedTools: string[];
+}
+
+/**
+ * Top-level daemon config. Contains resolved repos and daemon-level settings.
+ * Use `config.repos[i]` to get the RepoConfig for each repo.
+ */
+export interface AgentConfig {
+  repos: readonly RepoConfig[];
+  pollIntervalMs: number;
+  logFormat: "json" | "text";
+  logLevel: "debug" | "info" | "warn" | "error";
+}
+
+// --- Helpers ---
 
 function inferGithubRepo(repoPath: string): string | undefined {
   try {
@@ -49,6 +101,8 @@ function loadConfigFile(configPath?: string): Record<string, unknown> {
   return {};
 }
 
+// --- Config Loading ---
+
 export function loadConfig(configPath?: string): AgentConfig {
   const fileConfig = loadConfigFile(configPath);
 
@@ -67,6 +121,7 @@ export function loadConfig(configPath?: string): AgentConfig {
     allowedTools: fileConfig.allowedTools,
     logFormat: process.env.AI_AGENT_LOG_FORMAT ?? fileConfig.logFormat,
     logLevel: process.env.AI_AGENT_LOG_LEVEL ?? fileConfig.logLevel,
+    repos: fileConfig.repos,
   };
 
   // Remove undefined keys so Zod defaults apply
@@ -74,18 +129,72 @@ export function loadConfig(configPath?: string): AgentConfig {
     Object.entries(merged).filter(([, v]) => v !== undefined)
   );
 
-  const config = configSchema.parse(cleaned);
+  const parsed = configSchema.parse(cleaned);
 
-  // Infer githubRepo from git remote if not provided
-  if (!config.githubRepo) {
-    const inferred = inferGithubRepo(config.repoPath);
-    if (!inferred) {
-      throw new Error(
-        "githubRepo could not be inferred from git remote. Set AI_AGENT_GITHUB_REPO or githubRepo in config."
-      );
+  // Global settings shared by all repos
+  const globals = {
+    maxTurns: parsed.maxTurns,
+    maxDurationMs: parsed.maxDurationMs,
+    maxRevisionAttempts: parsed.maxRevisionAttempts,
+    allowedTools: [...parsed.allowedTools],
+  };
+
+  let repos: RepoConfig[];
+
+  if (parsed.repos && parsed.repos.length > 0) {
+    // Multi-repo mode
+    repos = parsed.repos.map((entry) => {
+      const repoPath = resolve(entry.repoPath);
+      let githubRepo = entry.githubRepo;
+      if (!githubRepo) {
+        githubRepo = inferGithubRepo(repoPath);
+        if (!githubRepo) {
+          throw new Error(
+            `githubRepo could not be inferred for repo "${entry.name}". Set it explicitly.`
+          );
+        }
+      }
+      return {
+        name: entry.name,
+        repoPath,
+        githubRepo,
+        triggerLabel: entry.triggerLabel ?? parsed.triggerLabel,
+        baseBranch: entry.baseBranch ?? parsed.baseBranch,
+        featureBranch: entry.featureBranch ?? parsed.featureBranch,
+        skillPath: entry.skillPath,
+        prompt: entry.prompt,
+        ...globals,
+      };
+    });
+  } else {
+    // Single-repo mode (backward compat)
+    const repoPath = resolve(parsed.repoPath);
+    let githubRepo = parsed.githubRepo;
+    if (!githubRepo) {
+      githubRepo = inferGithubRepo(repoPath);
+      if (!githubRepo) {
+        throw new Error(
+          "githubRepo could not be inferred from git remote. Set AI_AGENT_GITHUB_REPO or githubRepo in config."
+        );
+      }
     }
-    (config as { githubRepo: string }).githubRepo = inferred;
+    repos = [{
+      name: githubRepo.split("/").pop()!,
+      repoPath,
+      githubRepo,
+      triggerLabel: parsed.triggerLabel,
+      baseBranch: parsed.baseBranch,
+      featureBranch: parsed.featureBranch,
+      skillPath: parsed.skillPath,
+      prompt: parsed.prompt,
+      ...globals,
+    }];
   }
 
-  return Object.freeze(config);
+  return Object.freeze({
+    repos: Object.freeze(repos),
+    pollIntervalMs: parsed.pollIntervalMs,
+    logFormat: parsed.logFormat,
+    logLevel: parsed.logLevel,
+  });
 }

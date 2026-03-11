@@ -1,10 +1,28 @@
 {
-  "repoPath": ".",
-  "githubRepo": "owner/repo",
+  "repos": [
+    {
+      "name": "worker",
+      "repoPath": "../slashbin-io-worker",
+      "githubRepo": "xrgarcia/slashbin-io-worker",
+      "skillPath": ".claude/skills/implement-approved-issues/SKILL.md"
+    },
+    {
+      "name": "gateway",
+      "repoPath": "../Slashbin-Ingest-Gateway",
+      "githubRepo": "xrgarcia/Slashbin-Ingest-Gateway",
+      "skillPath": ".claude/skills/implement-approved-issues/SKILL.md"
+    },
+    {
+      "name": "console",
+      "repoPath": "../Slashbin-console",
+      "githubRepo": "xrgarcia/Slashbin-console",
+      "skillPath": ".claude/skills/implement-approved-issues/SKILL.md"
+    }
+  ],
   "triggerLabel": "approved",
-  "pollIntervalMs": 300000,
   "baseBranch": "develop",
   "featureBranch": "features",
+  "pollIntervalMs": 300000,
   "maxTurns": 30,
   "maxDurationMs": 1800000,
   "logFormat": "text",

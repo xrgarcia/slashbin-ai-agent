@@ -23,15 +23,22 @@ export function startDaemon(config: AgentConfig, logger: Logger): DaemonHandle {
     }
   };
 
+  const repoNames = config.repos.map((r) => r.name).join(", ");
   logger.info("Daemon starting", {
-    repo: config.githubRepo,
-    repoPath: config.repoPath,
-    triggerLabel: config.triggerLabel,
+    repos: repoNames,
+    repoCount: config.repos.length,
     pollInterval: `${config.pollIntervalMs / 1000}s`,
-    baseBranch: config.baseBranch,
-    featureBranch: config.featureBranch,
-    maxTurns: config.maxTurns,
   });
+
+  for (const repo of config.repos) {
+    logger.info(`  repo: ${repo.name}`, {
+      githubRepo: repo.githubRepo,
+      repoPath: repo.repoPath,
+      triggerLabel: repo.triggerLabel,
+      baseBranch: repo.baseBranch,
+      featureBranch: repo.featureBranch,
+    });
+  }
 
   // Run first cycle immediately
   run();

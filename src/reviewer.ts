@@ -1,4 +1,4 @@
-import type { AgentConfig } from "./config.js";
+import type { RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import type { RevisionTask } from "./agent.js";
 import {
@@ -7,7 +7,7 @@ import {
   isPROpen,
   type PRReviewFeedback,
 } from "./github.js";
-import { loadState, saveState } from "./state.js";
+import { loadRepoState, saveRepoState } from "./state.js";
 
 export interface TrackedPR {
   prNumber: number;
@@ -24,27 +24,32 @@ export interface ReviewerState {
   revising: number | null;
 }
 
-let trackedPRs = new Map<number, TrackedPR>();
-let initialized = false;
+// Per-repo cache: repoName → (prNumber → TrackedPR)
+const cache = new Map<string, Map<number, TrackedPR>>();
 
-function ensureLoaded(): void {
-  if (initialized) return;
-  const state = loadState();
+function ensureLoaded(repoName: string): Map<number, TrackedPR> {
+  const existing = cache.get(repoName);
+  if (existing) return existing;
+
+  const state = loadRepoState(repoName);
+  const prMap = new Map<number, TrackedPR>();
   for (const [key, pr] of Object.entries(state.trackedPRs)) {
-    trackedPRs.set(Number(key), pr);
+    prMap.set(Number(key), pr);
   }
-  initialized = true;
+  cache.set(repoName, prMap);
+  return prMap;
 }
 
-function persist(): void {
-  const state = loadState();
-  state.trackedPRs = Object.fromEntries(trackedPRs);
-  saveState(state);
+function persist(repoName: string): void {
+  const prMap = ensureLoaded(repoName);
+  const state = loadRepoState(repoName);
+  state.trackedPRs = Object.fromEntries(prMap);
+  saveRepoState(repoName, state);
 }
 
-export function trackPR(prNumber: number, issueNumber: number, repo: string): void {
-  ensureLoaded();
-  trackedPRs.set(prNumber, {
+export function trackPR(prNumber: number, issueNumber: number, repo: string, repoName: string): void {
+  const prMap = ensureLoaded(repoName);
+  prMap.set(prNumber, {
     prNumber,
     issueNumber,
     repo,
@@ -53,57 +58,57 @@ export function trackPR(prNumber: number, issueNumber: number, repo: string): vo
     lastAddressedCommentId: 0,
     status: "watching",
   });
-  persist();
+  persist(repoName);
 }
 
-export function getTrackedPRs(): Map<number, TrackedPR> {
-  ensureLoaded();
-  return trackedPRs;
+export function getTrackedPRs(repoName: string): Map<number, TrackedPR> {
+  return ensureLoaded(repoName);
 }
 
-export function getReviewerState(): ReviewerState {
-  ensureLoaded();
-  const tracked = [...trackedPRs.values()].map((pr) => ({
+export function getReviewerState(repoName: string): ReviewerState {
+  const prMap = ensureLoaded(repoName);
+  const tracked = [...prMap.values()].map((pr) => ({
     prNumber: pr.prNumber,
     issueNumber: pr.issueNumber,
     revisionCount: pr.revisionCount,
     status: pr.status,
   }));
-  const revising = [...trackedPRs.values()].find((pr) => pr.status === "revising")?.prNumber ?? null;
+  const revising = [...prMap.values()].find((pr) => pr.status === "revising")?.prNumber ?? null;
   return { tracked, revising };
 }
 
-export function markRevisionStarted(prNumber: number): void {
-  ensureLoaded();
-  const pr = trackedPRs.get(prNumber);
+export function markRevisionStarted(repoName: string, prNumber: number): void {
+  const prMap = ensureLoaded(repoName);
+  const pr = prMap.get(prNumber);
   if (pr) {
     pr.status = "revising";
-    persist();
+    persist(repoName);
   }
 }
 
 export function markRevisionComplete(
+  repoName: string,
   prNumber: number,
   lastReviewId: number,
   lastCommentId: number,
   maxAttempts: number
 ): void {
-  ensureLoaded();
-  const pr = trackedPRs.get(prNumber);
+  const prMap = ensureLoaded(repoName);
+  const pr = prMap.get(prNumber);
   if (!pr) return;
   pr.revisionCount++;
   pr.lastAddressedReviewId = lastReviewId;
   pr.lastAddressedCommentId = lastCommentId;
   pr.status = pr.revisionCount >= maxAttempts ? "abandoned" : "watching";
-  persist();
+  persist(repoName);
 }
 
-export function markApproved(prNumber: number): void {
-  ensureLoaded();
-  const pr = trackedPRs.get(prNumber);
+export function markApproved(repoName: string, prNumber: number): void {
+  const prMap = ensureLoaded(repoName);
+  const pr = prMap.get(prNumber);
   if (pr) {
     pr.status = "approved";
-    persist();
+    persist(repoName);
   }
 }
 
@@ -132,35 +137,36 @@ function getMaxIds(feedback: PRReviewFeedback): { reviewId: number; commentId: n
 }
 
 export function findNextRevision(
-  config: AgentConfig,
+  repoConfig: RepoConfig,
   logger: Logger
 ): { task: RevisionTask; maxIds: { reviewId: number; commentId: number } } | null {
-  ensureLoaded();
-  const repo = config.githubRepo!;
-  const cwd = config.repoPath;
+  const repoName = repoConfig.name;
+  const repo = repoConfig.githubRepo;
+  const cwd = repoConfig.repoPath;
+  const prMap = ensureLoaded(repoName);
 
   // Clean up: remove closed/merged PRs and check for approvals
   let changed = false;
-  for (const [prNumber, pr] of trackedPRs) {
+  for (const [prNumber, pr] of prMap) {
     if (pr.status === "approved" || pr.status === "abandoned") continue;
 
     if (!isPROpen(repo, prNumber, cwd)) {
       logger.debug(`PR #${prNumber} is no longer open, removing from tracking`);
-      trackedPRs.delete(prNumber);
+      prMap.delete(prNumber);
       changed = true;
       continue;
     }
 
     if (isPRApproved(repo, prNumber, cwd)) {
       logger.info(`PR #${prNumber} approved`);
-      markApproved(prNumber);
+      markApproved(repoName, prNumber);
       changed = true;
     }
   }
-  if (changed) persist();
+  if (changed) persist(repoName);
 
   // Get PRs that are watching and under the revision limit
-  const watching = [...trackedPRs.values()].filter((pr) => pr.status === "watching");
+  const watching = [...prMap.values()].filter((pr) => pr.status === "watching");
   if (watching.length === 0) return null;
 
   // Build lookup for last addressed IDs
@@ -183,7 +189,7 @@ export function findNextRevision(
   if (feedbacks.length === 0) return null;
 
   const feedback = feedbacks[0];
-  const pr = trackedPRs.get(feedback.prNumber)!;
+  const pr = prMap.get(feedback.prNumber)!;
   const maxIds = getMaxIds(feedback);
 
   return {
