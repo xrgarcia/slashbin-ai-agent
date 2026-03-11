@@ -15,7 +15,7 @@ const configSchema = z.object({
   featureBranch: z.string().default("features"),
   maxTurns: z.coerce.number().int().positive().default(30),
   maxDurationMs: z.coerce.number().int().positive().default(1_800_000),
-  anthropicApiKey: z.string().min(1, "anthropicApiKey (ANTHROPIC_API_KEY) is required"),
+  allowedTools: z.array(z.string()).default(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
   logFormat: z.enum(["json", "text"]).default("text"),
   logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
@@ -64,7 +64,7 @@ export function loadConfig(configPath?: string): AgentConfig {
     featureBranch: process.env.AI_AGENT_FEATURE_BRANCH ?? fileConfig.featureBranch,
     maxTurns: process.env.AI_AGENT_MAX_TURNS ?? fileConfig.maxTurns,
     maxDurationMs: process.env.AI_AGENT_MAX_DURATION_MS ?? fileConfig.maxDurationMs,
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? fileConfig.anthropicApiKey,
+    allowedTools: fileConfig.allowedTools,
     logFormat: process.env.AI_AGENT_LOG_FORMAT ?? fileConfig.logFormat,
     logLevel: process.env.AI_AGENT_LOG_LEVEL ?? fileConfig.logLevel,
   };

@@ -1,6 +1,6 @@
 # slashbin-ai-agent
 
-Lightweight daemon that watches a GitHub repo for issues with a trigger label and implements them using the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript).
+Lightweight daemon that watches a GitHub repo for issues with a trigger label and implements them using [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code). Uses your CLI subscription — no per-run API costs.
 
 ## How it works
 
@@ -10,7 +10,7 @@ Poll GitHub → Find approved issues → Implement with Claude → Create PR →
 
 1. Polls GitHub every N minutes for open issues with a configurable label (default: `approved`)
 2. Filters out issues that already have a linked PR or are labeled `blocked`
-3. Invokes the Claude Agent SDK to implement the oldest eligible issue
+3. Invokes Claude Code CLI (`claude --print`) to implement the oldest eligible issue
 4. One issue at a time — skips cycles while busy
 5. Tracks implemented/failed issues in-memory to avoid re-processing
 
@@ -22,9 +22,8 @@ git clone <repo-url>
 cd slashbin-ai-agent
 npm install && npm run build
 
-# 2. Configure (copy .env.example or set env vars)
+# 2. Configure — only GITHUB_TOKEN needed (Claude CLI uses your subscription)
 export GITHUB_TOKEN=ghp_...
-export ANTHROPIC_API_KEY=sk-ant-...
 
 # 3. Start the daemon (background)
 npm start
@@ -61,7 +60,6 @@ Create `.ai-agent.json` in your repo root, or use environment variables. Env var
 | `repoPath` | `AI_AGENT_REPO_PATH` | `.` | Path to local repo clone |
 | `githubRepo` | `AI_AGENT_GITHUB_REPO` | *(from git remote)* | GitHub `owner/repo` |
 | `githubToken` | `GITHUB_TOKEN` | **required** | GitHub PAT |
-| `anthropicApiKey` | `ANTHROPIC_API_KEY` | **required** | Anthropic API key |
 | `triggerLabel` | `AI_AGENT_TRIGGER_LABEL` | `approved` | Label that triggers implementation |
 | `pollIntervalMs` | `AI_AGENT_POLL_INTERVAL_MS` | `300000` (5 min) | Poll interval in milliseconds |
 | `skillPath` | `AI_AGENT_SKILL_PATH` | — | Path to a Claude Code skill file |
@@ -70,6 +68,7 @@ Create `.ai-agent.json` in your repo root, or use environment variables. Env var
 | `featureBranch` | `AI_AGENT_FEATURE_BRANCH` | `features` | Branch to commit to |
 | `maxTurns` | `AI_AGENT_MAX_TURNS` | `30` | Max agent turns per issue |
 | `maxDurationMs` | `AI_AGENT_MAX_DURATION_MS` | `1800000` (30 min) | Max implementation time |
+| `allowedTools` | — | `["Read","Write","Edit","Bash","Glob","Grep"]` | Tools the CLI can use |
 | `logFormat` | `AI_AGENT_LOG_FORMAT` | `text` | `json` or `text` |
 | `logLevel` | `AI_AGENT_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
@@ -124,7 +123,7 @@ src/
 ├── config.ts        # Configuration loading + Zod validation
 ├── logger.ts        # Structured logging (JSON/text)
 ├── github.ts        # GitHub polling (find actionable issues)
-├── agent.ts         # Claude Agent SDK wrapper
+├── agent.ts         # Claude Code CLI spawner
 ├── orchestrator.ts  # Concurrency control + state tracking
 ├── daemon.ts        # Poll loop + graceful shutdown
 └── index.ts         # Public API exports

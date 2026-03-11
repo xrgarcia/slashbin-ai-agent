@@ -1,4 +1,4 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { spawn, type ChildProcess } from "node:child_process";
 import type { AgentConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import type { ActionableIssue } from "./github.js";
@@ -7,7 +7,6 @@ export interface ImplementationResult {
   success: boolean;
   prUrl?: string;
   error?: string;
-  sessionId?: string;
 }
 
 const DEFAULT_PROMPT = `You have been assigned to implement GitHub issue #{{issue_number}}.
@@ -48,61 +47,103 @@ export async function implementIssue(
     prompt = `First, read and follow the skill at ${config.skillPath}.\n\n${prompt}`;
   }
 
-  const abortController = new AbortController();
+  const args = [
+    "--print",
+    prompt,
+    "--max-turns", String(config.maxTurns),
+    "--dangerously-skip-permissions",
+  ];
 
-  // Wire external abort signal
-  if (abortSignal) {
-    abortSignal.addEventListener("abort", () => abortController.abort());
+  if (config.allowedTools.length > 0) {
+    args.push("--allowedTools", config.allowedTools.join(","));
   }
 
-  // Timeout
-  const timeout = setTimeout(() => {
-    issueLogger.warn(`Implementation timed out after ${config.maxDurationMs}ms`);
-    abortController.abort();
-  }, config.maxDurationMs);
+  return new Promise<ImplementationResult>((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let child: ChildProcess | null = null;
+    let timedOut = false;
 
-  let sessionId: string | undefined;
-  let result = "";
-
-  try {
-    for await (const message of query({
-      prompt,
-      options: {
-        cwd: config.repoPath,
-        allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: config.maxTurns,
-        settingSources: ["project"],
-        env: {
-          GITHUB_TOKEN: config.githubToken,
-          ...(process.env.NPM_TOKEN ? { NPM_TOKEN: process.env.NPM_TOKEN } : {}),
-        },
-      },
-    })) {
-      if ("result" in message) {
-        result = message.result;
-        issueLogger.info("Agent completed");
-      } else if (message.type === "system" && message.subtype === "init") {
-        sessionId = message.session_id;
-        issueLogger.debug(`Session started: ${sessionId}`);
+    // Timeout
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      issueLogger.warn(`Implementation timed out after ${config.maxDurationMs}ms`);
+      if (child) {
+        child.kill("SIGTERM");
+        setTimeout(() => {
+          if (child && !child.killed) child.kill("SIGKILL");
+        }, 10_000);
       }
+    }, config.maxDurationMs);
+
+    // Wire external abort signal
+    const onAbort = () => {
+      issueLogger.warn("Implementation aborted");
+      if (child) child.kill("SIGTERM");
+    };
+    if (abortSignal) {
+      abortSignal.addEventListener("abort", onAbort, { once: true });
     }
 
-    // Extract PR URL from result
-    const prMatch = result.match(/github\.com\/[^/]+\/[^/]+\/pull\/\d+/);
-    const prUrl = prMatch ? `https://${prMatch[0]}` : undefined;
+    const env: Record<string, string> = {
+      ...process.env as Record<string, string>,
+      GITHUB_TOKEN: config.githubToken,
+    };
+    if (process.env.NPM_TOKEN) env.NPM_TOKEN = process.env.NPM_TOKEN;
 
-    if (prUrl) {
-      issueLogger.info(`PR created: ${prUrl}`);
-    }
+    child = spawn("claude", args, {
+      cwd: config.repoPath,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
-    return { success: true, prUrl, sessionId };
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    issueLogger.error(`Implementation failed: ${error}`);
-    return { success: false, error, sessionId };
-  } finally {
-    clearTimeout(timeout);
-  }
+    child.stdout?.on("data", (data: Buffer) => {
+      stdout += data.toString();
+    });
+
+    child.stderr?.on("data", (data: Buffer) => {
+      stderr += data.toString();
+      const lines = data.toString().split("\n").filter(Boolean);
+      for (const line of lines) {
+        issueLogger.debug(line);
+      }
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
+      issueLogger.error(`Failed to spawn claude CLI: ${err.message}`);
+      resolve({ success: false, error: `spawn error: ${err.message}` });
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
+      child = null;
+
+      if (timedOut) {
+        resolve({ success: false, error: "timed out" });
+        return;
+      }
+
+      if (code !== 0) {
+        const error = stderr.trim() || `exit code ${code}`;
+        issueLogger.error(`Claude CLI exited with code ${code}: ${error}`);
+        resolve({ success: false, error });
+        return;
+      }
+
+      // Extract PR URL from output
+      const prMatch = stdout.match(/github\.com\/[^/]+\/[^/]+\/pull\/\d+/);
+      const prUrl = prMatch ? `https://${prMatch[0]}` : undefined;
+
+      if (prUrl) {
+        issueLogger.info(`PR created: ${prUrl}`);
+      } else {
+        issueLogger.info("Implementation completed (no PR URL found in output)");
+      }
+
+      resolve({ success: true, prUrl });
+    });
+  });
 }
