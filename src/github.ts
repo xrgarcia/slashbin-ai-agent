@@ -81,7 +81,7 @@ export async function findActionableIssues(
       });
     }
 
-    // Sort oldest first (highest issue number = newest, so sort ascending)
+    // Sort oldest first (lowest issue number first)
     actionable.sort((a, b) => a.number - b.number);
 
     return actionable;
@@ -93,198 +93,6 @@ export async function findActionableIssues(
   }
 }
 
-// --- Discover PRs needing revision (not created by daemon) ---
-
-export interface PendingRevisionIssue {
-  issueNumber: number;
-  prNumber: number;
-}
-
-export function findPendingRevisionPRs(
-  config: RepoConfig,
-  logger: Logger
-): PendingRevisionIssue[] {
-  const repo = config.githubRepo;
-  const results: PendingRevisionIssue[] = [];
-
-  try {
-    const json = gh([
-      "issue", "list",
-      "--repo", repo,
-      "--state", "open",
-      "--label", "pr pending actions",
-      "--json", "number,title",
-      "--limit", "50",
-    ], config.repoPath);
-
-    const issues: { number: number; title: string }[] = JSON.parse(json || "[]");
-
-    for (const issue of issues) {
-      // Find the linked open PR for this issue
-      try {
-        const prJson = gh([
-          "pr", "list",
-          "--repo", repo,
-          "--state", "open",
-          "--search", `${issue.number} in:body`,
-          "--json", "number",
-          "--limit", "1",
-        ], config.repoPath);
-
-        const prs: { number: number }[] = JSON.parse(prJson || "[]");
-        if (prs.length > 0) {
-          results.push({ issueNumber: issue.number, prNumber: prs[0].number });
-        } else {
-          logger.debug(`No open PR found for pending-actions issue #${issue.number}`);
-        }
-      } catch (err) {
-        logger.debug(`Failed to find PR for issue #${issue.number}`, {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-  } catch (err) {
-    logger.error("Failed to poll for pending revision issues", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  return results;
-}
-
-// --- PR Review Polling ---
-
-export interface PRReviewFeedback {
-  prNumber: number;
-  reviews: Array<{ id: number; state: string; body: string; user: string }>;
-  comments: Array<{ id: number; body: string; user: string }>;
-}
-
-interface GhReview {
-  id: number;
-  state: string;
-  body: string;
-  author: { login: string };
-}
-
-interface GhComment {
-  id: number;
-  body: string;
-  author: { login: string };
-}
-
-export function getGhUser(cwd: string): string {
-  try {
-    const json = gh(["api", "user", "--jq", ".login"], cwd);
-    return json;
-  } catch {
-    return "";
-  }
-}
-
-export function findPRsNeedingRevision(
-  repo: string,
-  trackedPRNumbers: number[],
-  lastAddressedIds: Map<number, { reviewId: number; commentId: number }>,
-  cwd: string,
-  logger: Logger
-): PRReviewFeedback[] {
-  if (trackedPRNumbers.length === 0) return [];
-
-  const ghUser = getGhUser(cwd);
-  const results: PRReviewFeedback[] = [];
-
-  for (const prNumber of trackedPRNumbers) {
-    try {
-      // Get reviews
-      const reviewsJson = gh([
-        "api", `repos/${repo}/pulls/${prNumber}/reviews`,
-        "--jq", "[.[] | {id: .id, state: .state, body: .body, author: {login: .user.login}}]",
-      ], cwd);
-      const allReviews: GhReview[] = JSON.parse(reviewsJson || "[]");
-
-      // Get comments
-      const commentsJson = gh([
-        "pr", "view", String(prNumber),
-        "--repo", repo,
-        "--json", "comments",
-      ], cwd);
-      const parsed = JSON.parse(commentsJson || '{"comments":[]}');
-      const allComments: GhComment[] = parsed.comments ?? [];
-
-      const lastIds = lastAddressedIds.get(prNumber) ?? { reviewId: 0, commentId: 0 };
-
-      // Filter to new reviews (not from self, newer than last addressed)
-      const newReviews = allReviews
-        .filter((r) => r.id > lastIds.reviewId)
-        .filter((r) => r.author.login !== ghUser)
-        .map((r) => ({ id: r.id, state: r.state, body: r.body, user: r.author.login }));
-
-      // Filter to new comments (not from self, newer than last addressed)
-      const newComments = allComments
-        .filter((c) => c.id > lastIds.commentId)
-        .filter((c) => c.author.login !== ghUser)
-        .map((c) => ({ id: c.id, body: c.body, user: c.author.login }));
-
-      // Only include if there's actionable feedback
-      const hasChangesRequested = newReviews.some((r) => r.state === "CHANGES_REQUESTED");
-      const hasNewComments = newComments.length > 0;
-
-      if (hasChangesRequested || hasNewComments) {
-        results.push({ prNumber, reviews: newReviews, comments: newComments });
-      }
-    } catch (err) {
-      logger.debug(`Failed to check reviews for PR #${prNumber}`, {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  return results;
-}
-
-export function commentOnPR(repo: string, prNumber: number, body: string, cwd: string): void {
-  gh(["pr", "comment", String(prNumber), "--repo", repo, "--body", body], cwd);
-}
-
-export function getPRDiff(repo: string, prNumber: number, cwd: string): string {
-  try {
-    return gh(["pr", "diff", String(prNumber), "--repo", repo], cwd);
-  } catch {
-    return "";
-  }
-}
-
-export function isPRApproved(repo: string, prNumber: number, cwd: string): boolean {
-  try {
-    const json = gh([
-      "pr", "view", String(prNumber),
-      "--repo", repo,
-      "--json", "reviewDecision",
-    ], cwd);
-    const parsed = JSON.parse(json || "{}");
-    return parsed.reviewDecision === "APPROVED";
-  } catch {
-    return false;
-  }
-}
-
-export function isPROpen(repo: string, prNumber: number, cwd: string): boolean {
-  try {
-    const json = gh([
-      "pr", "view", String(prNumber),
-      "--repo", repo,
-      "--json", "state",
-    ], cwd);
-    const parsed = JSON.parse(json || "{}");
-    return parsed.state === "OPEN";
-  } catch {
-    return false;
-  }
-}
-
-// --- Issue Polling (existing) ---
-
 function checkForLinkedPR(
   repo: string,
   issueNumber: number,
@@ -292,7 +100,6 @@ function checkForLinkedPR(
   logger: Logger
 ): boolean {
   try {
-    // Search for open PRs that mention this issue
     const json = gh([
       "pr", "list",
       "--repo", repo,

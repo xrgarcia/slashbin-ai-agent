@@ -1,16 +1,7 @@
 import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
-import { findActionableIssues, findPendingRevisionPRs, commentOnPR } from "./github.js";
-import { implementIssue, reviseForPR, type ImplementationResult } from "./agent.js";
-import {
-  trackPR,
-  getTrackedPRs,
-  findNextRevision,
-  markRevisionStarted,
-  markRevisionComplete,
-  getReviewerState,
-  type ReviewerState,
-} from "./reviewer.js";
+import { findActionableIssues } from "./github.js";
+import { implementIssue, type ImplementationResult } from "./agent.js";
 import { loadRepoState, saveRepoState, setStatePath } from "./state.js";
 
 interface FailedIssue {
@@ -20,18 +11,15 @@ interface FailedIssue {
 
 export interface OrchestratorState {
   implementing: { repo: string; issue: number } | null;
-  revising: { repo: string; pr: number } | null;
   repos: Record<string, {
     implemented: number[];
     failed: Record<number, FailedIssue>;
-    trackedPRs: ReviewerState;
   }>;
 }
 
 const MAX_RETRIES = 2;
 
 let implementing: { repo: string; issue: number } | null = null;
-let revising: { repo: string; pr: number } | null = null;
 let abortController: AbortController | null = null;
 
 // Per-repo in-memory caches
@@ -70,10 +58,9 @@ export function getState(config: AgentConfig): OrchestratorState {
     repos[repo.name] = {
       implemented: [...implemented],
       failed: Object.fromEntries(failed),
-      trackedPRs: getReviewerState(repo.name),
     };
   }
-  return { implementing, revising, repos };
+  return { implementing, repos };
 }
 
 export function getAbortController(): AbortController | null {
@@ -87,9 +74,9 @@ export async function runCycle(
 ): Promise<ImplementationResult | null> {
   const cycleLogger = logger.child({ cycle: cycleNumber, phase: "poll" });
 
-  if (implementing !== null || revising !== null) {
+  if (implementing !== null) {
     cycleLogger.info(
-      `Busy (implementing=${implementing ? `${implementing.repo}#${implementing.issue}` : "none"}, revising=${revising ? `${revising.repo}#PR${revising.pr}` : "none"}), skipping cycle`
+      `Busy implementing ${implementing.repo}#${implementing.issue}, skipping cycle`
     );
     return null;
   }
@@ -97,29 +84,7 @@ export async function runCycle(
   let totalProcessed = 0;
   let lastResult: ImplementationResult | null = null;
 
-  // --- Priority 0: Discover orphaned PRs needing revision ---
-  for (const repoConfig of config.repos) {
-    const pending = findPendingRevisionPRs(repoConfig, cycleLogger);
-    const prMap = getTrackedPRs(repoConfig.name);
-    for (const { issueNumber, prNumber } of pending) {
-      if (!prMap.has(prNumber)) {
-        trackPR(prNumber, issueNumber, repoConfig.githubRepo, repoConfig.name);
-        cycleLogger.info(`Discovered orphaned PR #${prNumber} for issue #${issueNumber} (${repoConfig.name})`);
-      }
-    }
-  }
-
-  // --- Priority 1: Drain all revisions across all repos ---
-  for (const repoConfig of config.repos) {
-    let result = await tryRevision(repoConfig, logger, cycleNumber);
-    while (result) {
-      totalProcessed++;
-      lastResult = result;
-      result = await tryRevision(repoConfig, logger, cycleNumber);
-    }
-  }
-
-  // --- Priority 2: Drain all new issues across all repos ---
+  // Drain all approved issues across all repos
   for (const repoConfig of config.repos) {
     let result = await tryImplementation(repoConfig, logger, cycleNumber);
     while (result) {
@@ -136,84 +101,6 @@ export async function runCycle(
   }
 
   return lastResult;
-}
-
-async function tryRevision(
-  repoConfig: RepoConfig,
-  logger: Logger,
-  cycleNumber: number
-): Promise<ImplementationResult | null> {
-  const repoName = repoConfig.name;
-  const repoLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "revision-check" });
-
-  const revision = findNextRevision(repoConfig, repoLogger);
-  if (!revision) return null;
-
-  const { task, maxIds } = revision;
-  const repo = repoConfig.githubRepo;
-  const cwd = repoConfig.repoPath;
-
-  revising = { repo: repoName, pr: task.prNumber };
-  abortController = new AbortController();
-  markRevisionStarted(repoName, task.prNumber);
-
-  const revLogger = logger.child({
-    cycle: cycleNumber,
-    repo: repoName,
-    pr: task.prNumber,
-    issue: task.issueNumber,
-    phase: "revise",
-  });
-
-  revLogger.info(`Revising PR #${task.prNumber} for issue #${task.issueNumber}`);
-
-  try {
-    commentOnPR(
-      repo,
-      task.prNumber,
-      "Acknowledged — changes underway based on review feedback.",
-      cwd
-    );
-
-    const result = await reviseForPR(task, repoConfig, revLogger, abortController.signal);
-
-    if (result.success) {
-      commentOnPR(
-        repo,
-        task.prNumber,
-        "Changes pushed addressing review feedback. Please review.",
-        cwd
-      );
-      markRevisionComplete(repoName, task.prNumber, maxIds.reviewId, maxIds.commentId, repoConfig.maxRevisionAttempts);
-      revLogger.info(`Revision of PR #${task.prNumber} completed successfully`);
-    } else {
-      commentOnPR(
-        repo,
-        task.prNumber,
-        `Revision attempt failed: ${result.error}. Will retry on next cycle.`,
-        cwd
-      );
-      markRevisionComplete(repoName, task.prNumber, maxIds.reviewId, maxIds.commentId, repoConfig.maxRevisionAttempts);
-      revLogger.warn(`Revision of PR #${task.prNumber} failed: ${result.error}`);
-    }
-
-    const { tracked } = getReviewerState(repoName);
-    const pr = tracked.find((p) => p.prNumber === task.prNumber);
-    if (pr?.status === "abandoned") {
-      commentOnPR(
-        repo,
-        task.prNumber,
-        `Maximum revision attempts (${repoConfig.maxRevisionAttempts}) reached. Manual intervention needed. Related issue: #${task.issueNumber}`,
-        cwd
-      );
-      revLogger.warn(`PR #${task.prNumber} abandoned after ${repoConfig.maxRevisionAttempts} revision attempts`);
-    }
-
-    return { success: result.success, error: result.error };
-  } finally {
-    revising = null;
-    abortController = null;
-  }
 }
 
 async function tryImplementation(
@@ -266,15 +153,6 @@ async function tryImplementation(
       implLogger.info(`Successfully implemented #${issue.number}`, {
         prUrl: result.prUrl,
       });
-
-      if (result.prUrl) {
-        const prMatch = result.prUrl.match(/\/pull\/(\d+)/);
-        if (prMatch) {
-          const prNumber = parseInt(prMatch[1], 10);
-          trackPR(prNumber, issue.number, repoConfig.githubRepo, repoName);
-          implLogger.info(`Tracking PR #${prNumber} for review feedback`);
-        }
-      }
     } else {
       const existing = failed.get(issue.number);
       failed.set(issue.number, {

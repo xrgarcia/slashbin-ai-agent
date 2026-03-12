@@ -5,3 +5,4 @@ dist/
 .agent.pid
 .agent-state.json
 agent.log
+.ai-agent.json

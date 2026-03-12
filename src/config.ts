@@ -33,7 +33,6 @@ const configSchema = z.object({
   pollIntervalMs: z.coerce.number().int().positive().default(300_000),
   maxTurns: z.coerce.number().int().positive().default(30),
   maxDurationMs: z.coerce.number().int().positive().default(1_800_000),
-  maxRevisionAttempts: z.coerce.number().int().positive().default(3),
   allowedTools: z.array(z.string()).default(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
   logFormat: z.enum(["json", "text"]).default("text"),
   logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -57,7 +56,6 @@ export interface RepoConfig {
   prompt?: string;
   maxTurns: number;
   maxDurationMs: number;
-  maxRevisionAttempts: number;
   allowedTools: string[];
 }
 
@@ -117,7 +115,6 @@ export function loadConfig(configPath?: string): AgentConfig {
     featureBranch: process.env.AI_AGENT_FEATURE_BRANCH ?? fileConfig.featureBranch,
     maxTurns: process.env.AI_AGENT_MAX_TURNS ?? fileConfig.maxTurns,
     maxDurationMs: process.env.AI_AGENT_MAX_DURATION_MS ?? fileConfig.maxDurationMs,
-    maxRevisionAttempts: process.env.AI_AGENT_MAX_REVISION_ATTEMPTS ?? fileConfig.maxRevisionAttempts,
     allowedTools: fileConfig.allowedTools,
     logFormat: process.env.AI_AGENT_LOG_FORMAT ?? fileConfig.logFormat,
     logLevel: process.env.AI_AGENT_LOG_LEVEL ?? fileConfig.logLevel,
@@ -135,7 +132,6 @@ export function loadConfig(configPath?: string): AgentConfig {
   const globals = {
     maxTurns: parsed.maxTurns,
     maxDurationMs: parsed.maxDurationMs,
-    maxRevisionAttempts: parsed.maxRevisionAttempts,
     allowedTools: [...parsed.allowedTools],
   };
 

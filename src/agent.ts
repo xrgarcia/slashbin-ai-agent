@@ -9,17 +9,6 @@ export interface ImplementationResult {
   error?: string;
 }
 
-export interface RevisionTask {
-  prNumber: number;
-  issueNumber: number;
-  feedbackSummary: string;
-}
-
-export interface RevisionResult {
-  success: boolean;
-  error?: string;
-}
-
 interface SpawnResult {
   stdout: string;
   stderr: string;
@@ -162,49 +151,4 @@ export async function implementIssue(
   }
 
   return { success: true, prUrl };
-}
-
-export async function reviseForPR(
-  task: RevisionTask,
-  config: RepoConfig,
-  logger: Logger,
-  abortSignal?: AbortSignal
-): Promise<RevisionResult> {
-  const revLogger = logger.child({ pr: task.prNumber, issue: task.issueNumber, phase: "revise" });
-  revLogger.info(`Starting revision of PR #${task.prNumber}`);
-
-  const prompt = `You are revising an existing pull request based on reviewer feedback.
-
-## PR #${task.prNumber} (for issue #${task.issueNumber})
-
-## Reviewer Feedback
-
-${task.feedbackSummary}
-
-## Instructions
-
-1. Check out the PR branch: \`gh pr checkout ${task.prNumber}\`
-2. Read the feedback carefully and understand what changes are needed.
-3. Make the requested changes.
-4. Commit with a clear message describing what you changed in response to the review.
-5. Push to the existing branch (\`git push\`).
-6. Do NOT create a new PR — push to the existing branch.
-7. After pushing, check out the base branch to leave the repo clean: \`git checkout ${config.featureBranch}\`
-
-Work autonomously. Do not ask questions — make reasonable decisions and proceed.`;
-
-  const result = await spawnClaude(prompt, config, revLogger, abortSignal);
-
-  if (result.timedOut) {
-    return { success: false, error: "timed out" };
-  }
-
-  if (result.exitCode !== 0) {
-    const error = result.stderr.trim() || `exit code ${result.exitCode}`;
-    revLogger.error(`Revision failed with code ${result.exitCode}: ${error}`);
-    return { success: false, error };
-  }
-
-  revLogger.info(`Revision of PR #${task.prNumber} completed`);
-  return { success: true };
 }

@@ -1,6 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { TrackedPR } from "./reviewer.js";
 
 interface FailedIssue {
   count: number;
@@ -10,7 +9,6 @@ interface FailedIssue {
 export interface RepoState {
   implemented: number[];
   failed: Record<number, FailedIssue>;
-  trackedPRs: Record<number, TrackedPR>;
 }
 
 interface PersistedState {
@@ -21,7 +19,6 @@ interface PersistedState {
 const EMPTY_REPO_STATE: RepoState = {
   implemented: [],
   failed: {},
-  trackedPRs: {},
 };
 
 let statePath = ".agent-state.json";
@@ -35,16 +32,18 @@ function loadRaw(): PersistedState {
     const raw = readFileSync(statePath, "utf-8");
     const parsed = JSON.parse(raw);
 
-    // V2 format (repos-scoped)
     if (parsed.version === 2 && parsed.repos) {
+      // Strip trackedPRs from any existing state
+      for (const repoName of Object.keys(parsed.repos)) {
+        delete parsed.repos[repoName].trackedPRs;
+      }
       return parsed;
     }
 
-    // V1 format (flat) — migrate to _migrated key
+    // V1 format (flat) — migrate
     const v1State: RepoState = {
       implemented: Array.isArray(parsed.implemented) ? parsed.implemented : [],
       failed: parsed.failed && typeof parsed.failed === "object" ? parsed.failed : {},
-      trackedPRs: parsed.trackedPRs && typeof parsed.trackedPRs === "object" ? parsed.trackedPRs : {},
     };
     return { version: 2, repos: { _migrated: v1State } };
   } catch {
@@ -63,13 +62,11 @@ function saveRaw(state: PersistedState): void {
 export function loadRepoState(repoName: string): RepoState {
   const state = loadRaw();
 
-  // Direct match
   if (state.repos[repoName]) {
     const repo = state.repos[repoName];
     return {
       implemented: [...repo.implemented],
       failed: { ...repo.failed },
-      trackedPRs: { ...repo.trackedPRs },
     };
   }
 
@@ -82,14 +79,12 @@ export function loadRepoState(repoName: string): RepoState {
     return {
       implemented: [...migrated.implemented],
       failed: { ...migrated.failed },
-      trackedPRs: { ...migrated.trackedPRs },
     };
   }
 
   return {
     implemented: [...EMPTY_REPO_STATE.implemented],
     failed: { ...EMPTY_REPO_STATE.failed },
-    trackedPRs: { ...EMPTY_REPO_STATE.trackedPRs },
   };
 }
 
