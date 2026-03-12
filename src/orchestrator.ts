@@ -1,6 +1,11 @@
 import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
-import { findActionableIssues } from "./github.js";
+import {
+  findActionableIssues,
+  findReadyForProdIssues,
+  hasOpenPromotionPR,
+  createPromotionPR,
+} from "./github.js";
 import { implementIssue, type ImplementationResult } from "./agent.js";
 import { loadRepoState, saveRepoState, setStatePath } from "./state.js";
 
@@ -94,6 +99,12 @@ export async function runCycle(
     }
   }
 
+  // --- Phase 2: Create promotion PRs for repos with ready-for-prod issues ---
+  for (const repoConfig of config.repos) {
+    const promotionCount = tryPromotion(repoConfig, logger, cycleNumber);
+    totalProcessed += promotionCount;
+  }
+
   if (totalProcessed === 0) {
     cycleLogger.info("No work across all repos");
   } else {
@@ -167,5 +178,47 @@ async function tryImplementation(
   } finally {
     implementing = null;
     abortController = null;
+  }
+}
+
+function tryPromotion(
+  repoConfig: RepoConfig,
+  logger: Logger,
+  cycleNumber: number
+): number {
+  const repoName = repoConfig.name;
+  const promoLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "promote" });
+
+  // Main-only repos (like docs) don't have develop → main promotion
+  if (repoConfig.baseBranch === "main" && repoConfig.featureBranch === "main") {
+    return 0;
+  }
+
+  const issues = findReadyForProdIssues(repoConfig.githubRepo, repoConfig.repoPath, promoLogger);
+  if (issues.length === 0) return 0;
+
+  promoLogger.info(`Found ${issues.length} issue(s) ready for prod release`);
+
+  // Don't create a duplicate promotion PR
+  if (hasOpenPromotionPR(repoConfig.githubRepo, "main", repoConfig.repoPath)) {
+    promoLogger.info("Promotion PR already open — skipping");
+    return 0;
+  }
+
+  const prUrl = createPromotionPR(
+    repoConfig.githubRepo,
+    "main",
+    issues,
+    repoConfig.repoPath,
+  );
+
+  if (prUrl) {
+    promoLogger.info(`Promotion PR created: ${prUrl}`, {
+      issues: issues.map((i) => i.number),
+    });
+    return 1;
+  } else {
+    promoLogger.warn("Failed to create promotion PR");
+    return 0;
   }
 }

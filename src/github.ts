@@ -93,6 +93,102 @@ export async function findActionableIssues(
   }
 }
 
+// --- Promotion PR Creation ---
+
+export interface PromotionIssue {
+  number: number;
+  title: string;
+}
+
+export function findReadyForProdIssues(
+  repo: string,
+  cwd: string,
+  logger: Logger
+): PromotionIssue[] {
+  try {
+    const json = gh([
+      "issue", "list",
+      "--repo", repo,
+      "--state", "open",
+      "--label", "ready for prod release",
+      "--json", "number,title",
+      "--limit", "100",
+    ], cwd);
+
+    return JSON.parse(json || "[]");
+  } catch (err) {
+    logger.error("Failed to query ready-for-prod issues", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+export function hasOpenPromotionPR(
+  repo: string,
+  baseBranch: string,
+  cwd: string,
+): boolean {
+  try {
+    const json = gh([
+      "pr", "list",
+      "--repo", repo,
+      "--state", "open",
+      "--base", baseBranch,
+      "--head", "develop",
+      "--json", "number",
+      "--limit", "1",
+    ], cwd);
+
+    const prs = JSON.parse(json || "[]");
+    return prs.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function createPromotionPR(
+  repo: string,
+  baseBranch: string,
+  issues: PromotionIssue[],
+  cwd: string,
+): string | null {
+  const issueList = issues
+    .map((i) => `- #${i.number}: ${i.title}`)
+    .join("\n");
+
+  const title = issues.length === 1
+    ? `release: ${issues[0].title}`
+    : `release: promote ${issues.length} changes to production`;
+
+  const body = `## Production Promotion
+
+### Issues included
+${issueList}
+
+---
+Automated by slashbin-ai-agent`;
+
+  try {
+    const result = gh([
+      "pr", "create",
+      "--repo", repo,
+      "--base", baseBranch,
+      "--head", "develop",
+      "--title", title,
+      "--body", body,
+    ], cwd);
+
+    // Extract PR URL from output
+    const match = result.match(/https:\/\/github\.com\/[^\s]+/);
+    return match ? match[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- Linked PR Check ---
+
 function checkForLinkedPR(
   repo: string,
   issueNumber: number,
