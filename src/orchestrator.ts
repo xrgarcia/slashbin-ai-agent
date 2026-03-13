@@ -3,7 +3,7 @@ import type { Logger } from "./logger.js";
 import {
   findActionableIssues,
   findReadyForProdIssues,
-  hasOpenPromotionPR,
+  findOpenPromotionPR,
   createPromotionPR,
 } from "./github.js";
 import { implementIssue, type ImplementationResult } from "./agent.js";
@@ -200,8 +200,9 @@ function tryPromotion(
   promoLogger.info(`Found ${issues.length} issue(s) ready for prod release`);
 
   // Don't create a duplicate promotion PR
-  if (hasOpenPromotionPR(repoConfig.githubRepo, "main", repoConfig.repoPath)) {
-    promoLogger.info("Promotion PR already open — skipping");
+  const existingPR = findOpenPromotionPR(repoConfig.githubRepo, "main", repoConfig.repoPath);
+  if (existingPR) {
+    promoLogger.warn(`Promotion PR already open — #${existingPR.number}: ${existingPR.url}`);
     return 0;
   }
 

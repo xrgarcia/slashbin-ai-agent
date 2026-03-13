@@ -124,11 +124,16 @@ export function findReadyForProdIssues(
   }
 }
 
-export function hasOpenPromotionPR(
+export interface OpenPromotionPR {
+  number: number;
+  url: string;
+}
+
+export function findOpenPromotionPR(
   repo: string,
   baseBranch: string,
   cwd: string,
-): boolean {
+): OpenPromotionPR | null {
   try {
     const json = gh([
       "pr", "list",
@@ -136,14 +141,14 @@ export function hasOpenPromotionPR(
       "--state", "open",
       "--base", baseBranch,
       "--head", "develop",
-      "--json", "number",
+      "--json", "number,url",
       "--limit", "1",
     ], cwd);
 
-    const prs = JSON.parse(json || "[]");
-    return prs.length > 0;
+    const prs: OpenPromotionPR[] = JSON.parse(json || "[]");
+    return prs.length > 0 ? prs[0] : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
