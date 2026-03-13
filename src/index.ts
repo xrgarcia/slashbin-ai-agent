@@ -1,8 +1,7 @@
 export { loadConfig, type AgentConfig, type RepoConfig } from "./config.js";
 export { createLogger, type Logger, type LogLevel } from "./logger.js";
-export { findActionableIssues, type ActionableIssue, verifyPRExists } from "./github.js";
-export { implementIssue, type ImplementationResult } from "./agent.js";
+export { hasApprovedIssues, verifyPRExists } from "./github.js";
+export { implementApprovedIssues, type ImplementationResult } from "./agent.js";
 export { reconcileRepo, type ReconciliationResult } from "./reconciler.js";
-export { runCycle, getState, initState, type OrchestratorState } from "./orchestrator.js";
-export { loadRepoState, saveRepoState, setStatePath, type RepoState } from "./state.js";
+export { runCycle, getState, type OrchestratorState } from "./orchestrator.js";
 export { startDaemon, type DaemonHandle } from "./daemon.js";

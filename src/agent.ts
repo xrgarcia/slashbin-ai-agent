@@ -1,7 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type { RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
-import type { ActionableIssue } from "./github.js";
 import { verifyPRExists } from "./github.js";
 
 export interface ImplementationResult {
@@ -15,29 +14,6 @@ interface SpawnResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
-}
-
-const DEFAULT_PROMPT = `You have been assigned to implement GitHub issue #{{issue_number}}.
-
-## Issue: {{issue_title}}
-
-{{issue_body}}
-
-## Instructions
-
-1. Read the issue carefully and understand what needs to be done.
-2. Implement the changes described in the issue.
-3. Commit your changes with a clear commit message referencing the issue number.
-4. Push your changes and create a pull request.
-
-Work autonomously. Do not ask questions — make reasonable decisions and proceed.`;
-
-function buildPrompt(issue: ActionableIssue, config: RepoConfig): string {
-  const template = config.prompt ?? DEFAULT_PROMPT;
-  return template
-    .replace(/\{\{issue_number\}\}/g, String(issue.number))
-    .replace(/\{\{issue_title\}\}/g, issue.title)
-    .replace(/\{\{issue_body\}\}/g, issue.body);
 }
 
 function spawnClaude(
@@ -115,22 +91,36 @@ function spawnClaude(
   });
 }
 
-export async function implementIssue(
-  issue: ActionableIssue,
+/**
+ * Invoke Claude CLI to implement all approved issues for a repo.
+ * The skill (SKILL.md) owns inventory, prioritization, implementation,
+ * and PR creation. Foreman just triggers and detects the result.
+ */
+export async function implementApprovedIssues(
   config: RepoConfig,
   logger: Logger,
   abortSignal?: AbortSignal
 ): Promise<ImplementationResult> {
-  const issueLogger = logger.child({ issue: issue.number, phase: "implement" });
-  issueLogger.info(`Starting implementation of #${issue.number}: ${issue.title}`);
+  logger.info(`Starting batch implementation for ${config.name}`);
 
-  let prompt = buildPrompt(issue, config);
+  let prompt: string;
 
   if (config.skillPath) {
-    prompt = `First, read and follow the skill at ${config.skillPath}.\n\n${prompt}`;
+    prompt = `Read and follow the skill at ${config.skillPath}.\n\nImplement all approved issues for this repository. The skill defines the full workflow — follow it exactly.`;
+  } else if (config.prompt) {
+    prompt = config.prompt;
+  } else {
+    prompt = `Implement all open GitHub issues labeled "approved" in this repository.
+
+1. Query GitHub for approved issues: gh issue list --label approved --state open --json number,title,body,labels
+2. Prioritize by severity (S1 > security > S2+bug > ... > chore).
+3. Implement each issue, commit with message: fix|feat|chore: <description> (#<issue-number>)
+4. Push to ${config.featureBranch} and create a PR targeting ${config.baseBranch}.
+
+Work autonomously. Do not ask questions.`;
   }
 
-  const result = await spawnClaude(prompt, config, issueLogger, abortSignal);
+  const result = await spawnClaude(prompt, config, logger, abortSignal);
 
   if (result.timedOut) {
     return { success: false, error: "timed out" };
@@ -138,17 +128,17 @@ export async function implementIssue(
 
   if (result.exitCode !== 0) {
     const error = result.stderr.trim() || `exit code ${result.exitCode}`;
-    issueLogger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
+    logger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
   }
 
+  // Extract PR URL from Claude's output
   const prMatch = result.stdout.match(/github\.com\/[^/]+\/[^/]+\/pull\/\d+/);
   let prUrl = prMatch ? `https://${prMatch[0]}` : undefined;
 
-  // Fallback: query GitHub directly if PR URL wasn't found in Claude's output.
-  // --print mode emits prose, not raw tool output, so the URL may not be extractable.
+  // Fallback: query GitHub directly for an open feature PR
   if (!prUrl) {
-    issueLogger.info("PR URL not found in output, querying GitHub as fallback");
+    logger.info("PR URL not found in output, querying GitHub as fallback");
     const fallback = spawnSync("gh", [
       "pr", "list",
       "--repo", config.githubRepo,
@@ -162,7 +152,7 @@ export async function implementIssue(
     const fallbackUrl = fallback.stdout?.trim();
     if (fallbackUrl?.startsWith("https://")) {
       prUrl = fallbackUrl;
-      issueLogger.info(`PR found via GitHub fallback: ${prUrl}`);
+      logger.info(`PR found via GitHub fallback: ${prUrl}`);
     }
   }
 
@@ -175,15 +165,13 @@ export async function implementIssue(
       config.repoPath,
     );
     if (!verified) {
-      issueLogger.warn("PR URL found but verification failed — PR may not exist on GitHub");
+      logger.warn("PR URL found but verification failed — PR may not exist on GitHub");
       return { success: false, error: "PR creation could not be verified" };
     }
-    issueLogger.info(`PR created and verified: ${prUrl}`);
+    logger.info(`PR created and verified: ${prUrl}`);
     return { success: true, prUrl };
   }
 
-  // No PR found — treat as failure so the issue gets retried.
-  // Claude may have exited cleanly without committing, pushing, or creating a PR.
-  issueLogger.error("Implementation completed (exit 0) but no PR was created or found — marking as failed");
+  logger.error("Batch implementation completed (exit 0) but no PR was created or found — marking as failed");
   return { success: false, error: "no PR created" };
 }

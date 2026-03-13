@@ -1,69 +1,33 @@
 import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import {
-  findActionableIssues,
+  hasApprovedIssues,
   findReadyForProdIssues,
   findOpenPromotionPR,
   createPromotionPR,
 } from "./github.js";
-import { implementIssue, type ImplementationResult } from "./agent.js";
+import { implementApprovedIssues, type ImplementationResult } from "./agent.js";
 import { reconcileRepo } from "./reconciler.js";
-import { loadRepoState, saveRepoState, setStatePath } from "./state.js";
-
-interface FailedIssue {
-  count: number;
-  lastError: string;
-}
-
-export interface OrchestratorState {
-  implementing: { repo: string; issue: number } | null;
-  repos: Record<string, {
-    implemented: number[];
-    failed: Record<number, FailedIssue>;
-  }>;
-}
+import { verifyPRExists } from "./github.js";
 
 const MAX_RETRIES = 2;
 
-let implementing: { repo: string; issue: number } | null = null;
+let implementing: string | null = null; // repo name, or null
 let abortController: AbortController | null = null;
 
-// Per-repo in-memory caches
-const implementedCache = new Map<string, Set<number>>();
-const failedCache = new Map<string, Map<number, FailedIssue>>();
+// Per-repo consecutive batch failure count
+const failureCount = new Map<string, number>();
 
-function ensureLoaded(repoName: string): { implemented: Set<number>; failed: Map<number, FailedIssue> } {
-  let impl = implementedCache.get(repoName);
-  let fail = failedCache.get(repoName);
-  if (impl && fail) return { implemented: impl, failed: fail };
-
-  const state = loadRepoState(repoName);
-  impl = new Set(state.implemented);
-  fail = new Map(Object.entries(state.failed).map(([k, v]) => [Number(k), v]));
-  implementedCache.set(repoName, impl);
-  failedCache.set(repoName, fail);
-  return { implemented: impl, failed: fail };
-}
-
-function persist(repoName: string): void {
-  const { implemented, failed } = ensureLoaded(repoName);
-  const state = loadRepoState(repoName);
-  state.implemented = [...implemented];
-  state.failed = Object.fromEntries(failed);
-  saveRepoState(repoName, state);
-}
-
-export function initState(stateDir: string): void {
-  setStatePath(stateDir);
+export interface OrchestratorState {
+  implementing: string | null;
+  repos: Record<string, { failures: number }>;
 }
 
 export function getState(config: AgentConfig): OrchestratorState {
   const repos: OrchestratorState["repos"] = {};
   for (const repo of config.repos) {
-    const { implemented, failed } = ensureLoaded(repo.name);
     repos[repo.name] = {
-      implemented: [...implemented],
-      failed: Object.fromEntries(failed),
+      failures: failureCount.get(repo.name) ?? 0,
     };
   }
   return { implementing, repos };
@@ -81,9 +45,7 @@ export async function runCycle(
   const cycleLogger = logger.child({ cycle: cycleNumber, phase: "poll" });
 
   if (implementing !== null) {
-    cycleLogger.info(
-      `Busy implementing ${implementing.repo}#${implementing.issue}, skipping cycle`
-    );
+    cycleLogger.info(`Busy implementing ${implementing}, skipping cycle`);
     return null;
   }
 
@@ -100,30 +62,21 @@ export async function runCycle(
           `Reconciled ${result.commitCount} orphaned commit(s) — PR created: ${result.prUrl}`,
           { issues: result.issueNumbers },
         );
-        // Mark reconciled issues as implemented so they aren't re-implemented
-        const { implemented, failed } = ensureLoaded(repoConfig.name);
-        for (const issueNum of result.issueNumbers) {
-          implemented.add(issueNum);
-          failed.delete(issueNum);
-        }
-        persist(repoConfig.name);
         totalProcessed++;
       }
     } catch (err) {
       reconLogger.error("Reconciliation failed", {
         error: err instanceof Error ? err.message : String(err),
       });
-      // Non-fatal — continue to implementation phase
     }
   }
 
-  // --- Phase 1: Drain all approved issues across all repos ---
+  // --- Phase 1: Implement approved issues (one batch per repo) ---
   for (const repoConfig of config.repos) {
-    let result = await tryImplementation(repoConfig, logger, cycleNumber);
-    while (result) {
+    const result = await tryBatchImplementation(repoConfig, logger, cycleNumber);
+    if (result) {
       totalProcessed++;
       lastResult = result;
-      result = await tryImplementation(repoConfig, logger, cycleNumber);
     }
   }
 
@@ -142,64 +95,56 @@ export async function runCycle(
   return lastResult;
 }
 
-async function tryImplementation(
+async function tryBatchImplementation(
   repoConfig: RepoConfig,
   logger: Logger,
   cycleNumber: number
 ): Promise<ImplementationResult | null> {
   const repoName = repoConfig.name;
-  const repoLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "poll" });
+  const repoLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "implement" });
 
-  const { implemented, failed } = ensureLoaded(repoName);
+  // Check if this repo has exceeded batch failure retries
+  const failures = failureCount.get(repoName) ?? 0;
+  if (failures >= MAX_RETRIES) {
+    repoLogger.debug(`Skipping ${repoName} — ${failures} consecutive batch failures`);
+    return null;
+  }
 
-  const issues = await findActionableIssues(repoConfig, repoLogger);
-  repoLogger.debug(`Found ${issues.length} actionable issue(s) in ${repoName}`);
+  // Gate: are there approved issues to implement?
+  const hasWork = hasApprovedIssues(repoConfig, repoLogger);
+  if (!hasWork) {
+    // Reset failure count when there's no work (issues were resolved externally)
+    if (failures > 0) failureCount.set(repoName, 0);
+    return null;
+  }
 
-  const candidates = issues.filter((issue) => {
-    if (implemented.has(issue.number)) {
-      repoLogger.debug(`Skipping #${issue.number} — already implemented`);
-      return false;
-    }
-    const failure = failed.get(issue.number);
-    if (failure && failure.count >= MAX_RETRIES) {
-      repoLogger.debug(`Skipping #${issue.number} — failed ${failure.count} times`);
-      return false;
-    }
-    return true;
-  });
+  // Gate: is there already an open feature PR? If so, skill already ran — wait for review.
+  const hasFeaturePR = verifyPRExists(
+    repoConfig.githubRepo,
+    repoConfig.featureBranch,
+    repoConfig.baseBranch,
+    repoConfig.repoPath,
+  );
+  if (hasFeaturePR) {
+    repoLogger.debug(`Open PR exists for ${repoConfig.featureBranch} → ${repoConfig.baseBranch} — skipping`);
+    return null;
+  }
 
-  if (candidates.length === 0) return null;
-
-  const issue = candidates[0];
-  implementing = { repo: repoName, issue: issue.number };
+  // Invoke the skill — one Claude session implements all approved issues
+  implementing = repoName;
   abortController = new AbortController();
-
-  const implLogger = logger.child({
-    cycle: cycleNumber,
-    repo: repoName,
-    issue: issue.number,
-    phase: "implement",
-  });
-  implLogger.info(`Implementing #${issue.number}: ${issue.title}`);
+  repoLogger.info(`Triggering batch implementation for ${repoName}`);
 
   try {
-    const result = await implementIssue(issue, repoConfig, implLogger, abortController.signal);
+    const result = await implementApprovedIssues(repoConfig, repoLogger, abortController.signal);
 
     if (result.success) {
-      implemented.add(issue.number);
-      failed.delete(issue.number);
-      persist(repoName);
-      implLogger.info(`Successfully implemented #${issue.number}`, {
-        prUrl: result.prUrl,
-      });
+      failureCount.set(repoName, 0);
+      repoLogger.info(`Batch implementation succeeded`, { prUrl: result.prUrl });
     } else {
-      const existing = failed.get(issue.number);
-      failed.set(issue.number, {
-        count: (existing?.count ?? 0) + 1,
-        lastError: result.error ?? "unknown",
-      });
-      persist(repoName);
-      implLogger.warn(`Failed to implement #${issue.number}: ${result.error}`);
+      const newCount = failures + 1;
+      failureCount.set(repoName, newCount);
+      repoLogger.warn(`Batch implementation failed (${newCount}/${MAX_RETRIES}): ${result.error}`);
     }
 
     return result;

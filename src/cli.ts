@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { startDaemon } from "./daemon.js";
-import { runCycle, initState } from "./orchestrator.js";
+import { runCycle } from "./orchestrator.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -97,9 +97,6 @@ async function main(): Promise<void> {
     format: config.logFormat,
     level: config.logLevel,
   });
-
-  // State file lives in the ai-agent directory (not the target repo)
-  initState(resolve(__dirname, ".."));
 
   logger.info(`slashbin-ai-agent v${getVersion()}`);
 
