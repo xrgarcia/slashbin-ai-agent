@@ -92,7 +92,7 @@ function createReconciliationPR(
   logger: Logger,
 ): string | null {
   const issueList = issueNumbers.length > 0
-    ? issueNumbers.map((n) => `- Closes #${n}`).join("\n")
+    ? issueNumbers.map((n) => `- Related to #${n}`).join("\n")
     : "_No linked issues found in commit messages_";
 
   const title = issueNumbers.length === 1

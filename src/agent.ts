@@ -122,6 +122,8 @@ export async function implementApprovedIssues(
 3. Implement each issue, commit with message: fix|feat|chore: <description> (#<issue-number>)
 4. Push to ${config.featureBranch} and create a PR targeting ${config.baseBranch}.
 
+IMPORTANT: In PR descriptions, use "Related to #N" — NEVER use "Closes #N" or "Fixes #N". Issues are closed by the EM after production verification, not on dev merge.
+
 Work autonomously. Do not ask questions.`;
   }
 
