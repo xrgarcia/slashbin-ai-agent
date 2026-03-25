@@ -252,6 +252,92 @@ Automated by slashbin-ai-agent`;
   }
 }
 
+// --- Branch Sync ---
+
+export interface BranchDrift {
+  developBehindMain: number;
+  developAheadOfMain: number;
+}
+
+/**
+ * Check if develop has drifted behind main due to accumulated merge commits.
+ * Returns the drift counts, or null if the check fails.
+ */
+export function checkBranchDrift(
+  repo: string,
+  cwd: string,
+  logger: Logger,
+): BranchDrift | null {
+  try {
+    const json = gh([
+      "api", `repos/${repo}/compare/main...develop`,
+      "--jq", '{"ahead": .ahead_by, "behind": .behind_by}',
+    ], cwd);
+
+    const result = JSON.parse(json);
+    return {
+      developAheadOfMain: result.ahead,
+      developBehindMain: result.behind,
+    };
+  } catch (err) {
+    logger.error("Failed to check branch drift", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Check if a sync PR (main → develop) already exists.
+ */
+export function findOpenSyncPR(
+  repo: string,
+  cwd: string,
+): OpenPromotionPR | null {
+  try {
+    const json = gh([
+      "pr", "list",
+      "--repo", repo,
+      "--state", "open",
+      "--base", "develop",
+      "--head", "main",
+      "--json", "number,url",
+      "--limit", "1",
+    ], cwd);
+
+    const prs: OpenPromotionPR[] = JSON.parse(json || "[]");
+    return prs.length > 0 ? prs[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create a sync PR to merge main back into develop.
+ * This resolves merge commit drift that prevents promotion PRs.
+ */
+export function createSyncPR(
+  repo: string,
+  behindBy: number,
+  cwd: string,
+): string | null {
+  try {
+    const result = gh([
+      "pr", "create",
+      "--repo", repo,
+      "--base", "develop",
+      "--head", "main",
+      "--title", "chore: sync develop with main (merge commits backfill)",
+      "--body", `## Branch Sync\n\nSync \`develop\` with \`main\` to backfill ${behindBy} merge commit(s) from prior promotions. No code changes — only merge commit history alignment.\n\n---\nAutomated by slashbin-ai-agent`,
+    ], cwd);
+
+    const match = result.match(/https:\/\/github\.com\/[^\s]+/);
+    return match ? match[0] : null;
+  } catch {
+    return null;
+  }
+}
+
 // --- PR Verification ---
 
 export function verifyPRExists(

@@ -6,6 +6,9 @@ import {
   findReadyForProdIssues,
   findOpenPromotionPR,
   createPromotionPR,
+  checkBranchDrift,
+  findOpenSyncPR,
+  createSyncPR,
 } from "./github.js";
 import { implementApprovedIssues, revisePRFeedback, type ImplementationResult, type RevisionResult } from "./agent.js";
 import { reconcileRepo } from "./reconciler.js";
@@ -233,6 +236,28 @@ function tryPromotion(
   if (existingPR) {
     promoLogger.warn(`Promotion PR already open — #${existingPR.number}: ${existingPR.url}`);
     return 0;
+  }
+
+  // Check for branch drift (develop behind main due to merge commits)
+  const drift = checkBranchDrift(repoConfig.githubRepo, repoConfig.repoPath, promoLogger);
+  if (drift && drift.developBehindMain > 0) {
+    promoLogger.info(`develop is ${drift.developBehindMain} commit(s) behind main — sync required before promotion`);
+
+    // Check if a sync PR already exists
+    const existingSyncPR = findOpenSyncPR(repoConfig.githubRepo, repoConfig.repoPath);
+    if (existingSyncPR) {
+      promoLogger.info(`Sync PR already open — #${existingSyncPR.number}: ${existingSyncPR.url}`);
+      return 0;
+    }
+
+    const syncUrl = createSyncPR(repoConfig.githubRepo, drift.developBehindMain, repoConfig.repoPath);
+    if (syncUrl) {
+      promoLogger.info(`Sync PR created: ${syncUrl} — promotion will retry after sync merges`);
+      return 1;
+    } else {
+      promoLogger.warn("Failed to create sync PR");
+      return 0;
+    }
   }
 
   const prUrl = createPromotionPR(
