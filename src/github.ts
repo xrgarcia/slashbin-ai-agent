@@ -90,7 +90,9 @@ export function hasApprovedIssues(
 
     const uncovered: number[] = [];
     for (const issueNum of actionable) {
-      if (!prText.includes(`#${issueNum}`)) {
+      // Use word boundary to avoid #1 matching #10, #100, etc.
+      const pattern = new RegExp(`#${issueNum}(?!\\d)`);
+      if (!pattern.test(prText)) {
         uncovered.push(issueNum);
       }
     }
