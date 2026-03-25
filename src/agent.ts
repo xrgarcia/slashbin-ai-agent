@@ -179,6 +179,19 @@ Work autonomously. Do not ask questions.`;
     return { success: true, prUrl };
   }
 
+  // If Claude exited cleanly but no new PR was found, check if an existing
+  // feature PR already has the work (Claude may have added commits to it).
+  const existingPR = verifyPRExists(
+    config.githubRepo,
+    config.featureBranch,
+    config.baseBranch,
+    config.repoPath,
+  );
+  if (existingPR) {
+    logger.info("No new PR created, but existing feature PR found — treating as success (commits added to existing PR)");
+    return { success: true };
+  }
+
   logger.error("Batch implementation completed (exit 0) but no PR was created or found — marking as failed");
   return { success: false, error: "no PR created" };
 }

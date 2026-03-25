@@ -61,9 +61,11 @@ export function hasApprovedIssues(
 
     if (actionable.length === 0) return false;
 
-    // Loop detection: check if all actionable issues already have an open PR
+    // Loop detection: check if all actionable issues already have a PR (open or merged)
     // that references them. If so, skip — the Foreman already did the work.
-    const prJson = gh([
+    // Check both open and merged PRs to catch issues where the PR was already merged
+    // but the issue label wasn't updated.
+    const openPrJson = gh([
       "pr", "list",
       "--repo", repo,
       "--state", "open",
@@ -72,19 +74,33 @@ export function hasApprovedIssues(
       "--limit", "50",
     ], config.repoPath);
 
-    const prs: { number: number; title: string; body: string }[] = JSON.parse(prJson || "[]");
-    const prText = prs.map((pr) => `${pr.title} ${pr.body}`).join(" ");
+    const mergedPrJson = gh([
+      "pr", "list",
+      "--repo", repo,
+      "--state", "merged",
+      "--base", config.baseBranch,
+      "--json", "number,title,body",
+      "--limit", "20",
+    ], config.repoPath);
 
+    const openPrs: { number: number; title: string; body: string }[] = JSON.parse(openPrJson || "[]");
+    const mergedPrs: { number: number; title: string; body: string }[] = JSON.parse(mergedPrJson || "[]");
+    const allPrs = [...openPrs, ...mergedPrs];
+    const prText = allPrs.map((pr) => `${pr.title} ${pr.body}`).join(" ");
+
+    const uncovered: number[] = [];
     for (const issueNum of actionable) {
       if (!prText.includes(`#${issueNum}`)) {
-        logger.debug(`Found actionable issue #${issueNum} with no linked PR`);
-        return true;
+        uncovered.push(issueNum);
       }
     }
 
-    if (actionable.length > 0) {
-      logger.debug(`All ${actionable.length} actionable issue(s) already have open PRs — skipping`);
+    if (uncovered.length > 0) {
+      logger.info(`Found ${uncovered.length} actionable issue(s) with no linked PR: ${uncovered.map(n => `#${n}`).join(", ")}`);
+      return true;
     }
+
+    logger.info(`Skipped ${repo}: ${actionable.length} approved issue(s), all have linked PRs (open or merged)`);
     return false;
   } catch (err) {
     logger.error("Failed to check for approved issues", {
