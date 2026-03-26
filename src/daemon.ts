@@ -2,6 +2,7 @@ import type { AgentConfig } from "./config.js";
 import { loadConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { runCycle, getAbortController } from "./orchestrator.js";
+import { BridgeClient, type BridgeConfig } from "./bridge-client.js";
 
 export interface DaemonOptions {
   configPath?: string;
@@ -17,6 +18,30 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
   let stopping = false;
   let sleepResolve: (() => void) | null = null;
   let activeConfig = config;
+
+  // --- Discord Bridge ---
+  let bridge: BridgeClient | null = null;
+  const bridgeUrl = process.env.DISCORD_BRIDGE_URL || "ws://127.0.0.1:9800";
+  const discordBotId = process.env.DISCORD_BOT_ID;
+  const statusChannel = process.env.DISCORD_STATUS_CHANNEL;
+  const listenChannels = process.env.DISCORD_LISTEN_CHANNELS?.split(",").filter(Boolean) || [];
+
+  if (discordBotId && statusChannel) {
+    const bridgeConfig: BridgeConfig = {
+      url: bridgeUrl,
+      agentId: "foreman",
+      discordBotId,
+      channels: {
+        status: statusChannel,
+        listen: listenChannels,
+      },
+    };
+    bridge = new BridgeClient(bridgeConfig, logger);
+    bridge.connect();
+    logger.info("Discord bridge client initialized", { url: bridgeUrl, statusChannel });
+  } else {
+    logger.debug("Discord bridge disabled — DISCORD_BOT_ID and DISCORD_STATUS_CHANNEL not set");
+  }
 
   const repoNames = config.repos.map((r) => r.name).join(", ");
   logger.info("Daemon starting", {
@@ -84,7 +109,16 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
       activeConfig = reloadConfig();
 
       try {
-        const { didWork } = await runCycle(activeConfig, logger, cycleNumber);
+        const { didWork, lastImplementation } = await runCycle(activeConfig, logger, cycleNumber);
+
+        // Emit status to Discord bridge (only when something happened)
+        if (bridge && didWork) {
+          if (lastImplementation?.success) {
+            bridge.sendStatus(`PR created: ${lastImplementation.prUrl || "(reconciled)"}`, "info");
+          } else if (lastImplementation && !lastImplementation.success) {
+            bridge.sendStatus(`Implementation failed: ${lastImplementation.error}`, "error");
+          }
+        }
 
         // If cycle did work, immediately run the next cycle (no sleep)
         if (didWork) continue;
@@ -93,6 +127,7 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
           cycle: cycleNumber,
           error: err instanceof Error ? err.message : String(err),
         });
+        bridge?.sendStatus(`Cycle ${cycleNumber} error: ${err instanceof Error ? err.message : String(err)}`, "error");
       }
 
       // No work found — sleep until next poll interval (or until stopped)
@@ -137,6 +172,7 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
       }
     }
 
+    bridge?.shutdown();
     logger.info("Shutdown complete");
   };
 
