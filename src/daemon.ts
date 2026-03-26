@@ -24,8 +24,6 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
   const bridgeUrl = process.env.DISCORD_BRIDGE_URL || "ws://127.0.0.1:9800";
   const discordBotId = process.env.DISCORD_BOT_ID;
   const statusChannel = process.env.DISCORD_STATUS_CHANNEL;
-  const listenChannels = process.env.DISCORD_LISTEN_CHANNELS?.split(",").filter(Boolean) || [];
-
   if (discordBotId && statusChannel) {
     const bridgeConfig: BridgeConfig = {
       url: bridgeUrl,
@@ -33,7 +31,7 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
       discordBotId,
       channels: {
         status: statusChannel,
-        listen: listenChannels,
+        listen: [],  // Foreman is status-only — does not respond to commands
       },
     };
     bridge = new BridgeClient(bridgeConfig, logger);
@@ -114,9 +112,9 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
         // Emit status to Discord bridge (only when something happened)
         if (bridge && didWork) {
           if (lastImplementation?.success) {
-            bridge.sendStatus(`PR created: ${lastImplementation.prUrl || "(reconciled)"}`, "info");
+            bridge.sendStatus(`**FOREMAN:** PR created — ${lastImplementation.prUrl || "(reconciled)"}`, "info");
           } else if (lastImplementation && !lastImplementation.success) {
-            bridge.sendStatus(`Implementation failed: ${lastImplementation.error}`, "error");
+            bridge.sendStatus(`**FOREMAN:** Implementation failed — ${lastImplementation.error}`, "error");
           }
         }
 
@@ -127,7 +125,7 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
           cycle: cycleNumber,
           error: err instanceof Error ? err.message : String(err),
         });
-        bridge?.sendStatus(`Cycle ${cycleNumber} error: ${err instanceof Error ? err.message : String(err)}`, "error");
+        bridge?.sendStatus(`**FOREMAN:** Cycle ${cycleNumber} error — ${err instanceof Error ? err.message : String(err)}`, "error");
       }
 
       // No work found — sleep until next poll interval (or until stopped)
