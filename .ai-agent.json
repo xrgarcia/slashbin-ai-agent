@@ -61,7 +61,7 @@
   "baseBranch": "develop",
   "featureBranch": "features",
   "pollIntervalMs": 300000,
-  "maxTurns": 30,
+  "maxTurns": 50,
   "maxDurationMs": 1800000,
   "logFormat": "text",
   "logLevel": "info"

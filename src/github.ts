@@ -100,6 +100,8 @@ export function findActionableIssues(
     }
 
     if (uncovered.length > 0) {
+      // Sort ascending so lowest issue numbers (dependencies) come first
+      uncovered.sort((a, b) => a - b);
       const batch = uncovered.slice(0, MAX_BATCH_SIZE);
       if (uncovered.length > MAX_BATCH_SIZE) {
         logger.info(`Found ${uncovered.length} actionable issue(s), capping batch to ${MAX_BATCH_SIZE}: ${batch.map(n => `#${n}`).join(", ")} (${uncovered.length - MAX_BATCH_SIZE} deferred to next cycle)`);
