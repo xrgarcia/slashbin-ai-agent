@@ -102,7 +102,19 @@ export function findActionableIssues(
     if (uncovered.length > 0) {
       // Sort ascending so lowest issue numbers (dependencies) come first
       uncovered.sort((a, b) => a - b);
-      const batch = uncovered.slice(0, MAX_BATCH_SIZE);
+
+      // Greenfield detection: if repo has very few tracked files, limit to 1 issue
+      // The skill implements one-at-a-time anyway, but a focused prompt is more reliable
+      let effectiveBatchSize = MAX_BATCH_SIZE;
+      try {
+        const fileCount = gh(["ls-files", "--cached"], config.repoPath).split("\n").filter(Boolean).length;
+        if (fileCount < 10) {
+          effectiveBatchSize = 1;
+          logger.info(`Greenfield repo detected (${fileCount} files) — limiting to 1 issue per cycle`);
+        }
+      } catch { /* ignore — use default batch size */ }
+
+      const batch = uncovered.slice(0, effectiveBatchSize);
       if (uncovered.length > MAX_BATCH_SIZE) {
         logger.info(`Found ${uncovered.length} actionable issue(s), capping batch to ${MAX_BATCH_SIZE}: ${batch.map(n => `#${n}`).join(", ")} (${uncovered.length - MAX_BATCH_SIZE} deferred to next cycle)`);
       } else {
