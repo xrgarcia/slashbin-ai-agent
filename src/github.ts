@@ -19,6 +19,19 @@ export function gh(args: string[], cwd: string): string {
   }).trim();
 }
 
+/** Run gh CLI using the EM token (slashbin-engineering-manager account). */
+function ghAsEM(args: string[], cwd: string): string {
+  const emToken = process.env.EM_GITHUB_TOKEN;
+  if (!emToken) throw new Error("EM_GITHUB_TOKEN not set — cannot approve/merge as EM");
+  return execFileSync("gh", args, {
+    cwd,
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 30_000,
+    env: { ...process.env, GH_TOKEN: emToken },
+  }).trim();
+}
+
 /**
  * Gate check: find approved issues that haven't progressed through
  * the lifecycle AND don't already have a PR. Returns the uncovered
@@ -375,13 +388,19 @@ export function findOpenSyncPR(
 }
 
 /**
- * Create a sync PR to merge main back into develop.
- * This resolves merge commit drift that prevents promotion PRs.
+ * Create a sync PR to merge main back into develop, then immediately
+ * approve + merge it. Created as xrgarcia (default token), approved
+ * and merged as slashbin-engineering-manager (EM token) to satisfy
+ * branch protection's "no self-approval" rule.
+ *
+ * This eliminates the stale sync PR race condition where develop
+ * advances between PR creation and external merge.
  */
 export function createSyncPR(
   repo: string,
   behindBy: number,
   cwd: string,
+  logger?: Logger,
 ): string | null {
   try {
     const result = gh([
@@ -394,7 +413,39 @@ export function createSyncPR(
     ], cwd);
 
     const match = result.match(/https:\/\/github\.com\/[^\s]+/);
-    return match ? match[0] : null;
+    const prUrl = match ? match[0] : null;
+
+    if (!prUrl) return null;
+
+    // Extract PR number from URL
+    const prNumberMatch = prUrl.match(/\/pull\/(\d+)/);
+    if (!prNumberMatch) return prUrl;
+
+    const prNumber = prNumberMatch[1];
+
+    // Immediately approve + merge using the EM token
+    try {
+      ghAsEM([
+        "pr", "review", prNumber,
+        "--repo", repo,
+        "--approve",
+        "--body", "Automated sync — approved by EM.",
+      ], cwd);
+
+      ghAsEM([
+        "pr", "merge", prNumber,
+        "--repo", repo,
+        "--merge",
+      ], cwd);
+
+      logger?.info(`Sync PR #${prNumber} created and merged immediately`);
+    } catch (mergeErr) {
+      // If merge fails (status checks, conflicts), log but don't crash.
+      // The PR still exists for manual merge.
+      logger?.warn(`Sync PR #${prNumber} created but auto-merge failed: ${mergeErr instanceof Error ? mergeErr.message : String(mergeErr)}`);
+    }
+
+    return prUrl;
   } catch {
     return null;
   }

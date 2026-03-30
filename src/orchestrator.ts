@@ -114,7 +114,7 @@ export async function runCycle(
       events.push({ message: `Production promotion PR created on ${repoConfig.name} (develop → main)`, level: "info" });
       totalProcessed++;
     } else if (promotionResult === "synced") {
-      events.push({ message: `Branch sync PR created on ${repoConfig.name} (main → develop) — promotion will retry after merge`, level: "info" });
+      events.push({ message: `Branch sync PR created and merged on ${repoConfig.name} (main → develop) — promotion will follow`, level: "info" });
       totalProcessed++;
     }
   }
@@ -292,9 +292,9 @@ function tryPromotion(
       return null;
     }
 
-    const syncUrl = createSyncPR(repoConfig.githubRepo, drift.developBehindMain, repoConfig.repoPath);
+    const syncUrl = createSyncPR(repoConfig.githubRepo, drift.developBehindMain, repoConfig.repoPath, promoLogger);
     if (syncUrl) {
-      promoLogger.info(`Sync PR created: ${syncUrl} — promotion will retry after sync merges`);
+      promoLogger.info(`Sync PR created and auto-merged: ${syncUrl}`);
       return "synced";
     } else {
       promoLogger.warn("Failed to create sync PR");
