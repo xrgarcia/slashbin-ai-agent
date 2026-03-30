@@ -109,11 +109,14 @@ export async function runCycle(
 
   // --- Phase 3: Create promotion PRs for repos with ready-for-prod issues ---
   for (const repoConfig of config.repos) {
-    const promotionCount = tryPromotion(repoConfig, logger, cycleNumber);
-    if (promotionCount > 0) {
+    const promotionResult = tryPromotion(repoConfig, logger, cycleNumber);
+    if (promotionResult === "promoted") {
       events.push({ message: `Production promotion PR created on ${repoConfig.name} (develop → main)`, level: "info" });
+      totalProcessed++;
+    } else if (promotionResult === "synced") {
+      events.push({ message: `Branch sync PR created on ${repoConfig.name} (main → develop) — promotion will retry after merge`, level: "info" });
+      totalProcessed++;
     }
-    totalProcessed += promotionCount;
   }
 
   if (totalProcessed === 0) {
@@ -256,17 +259,17 @@ function tryPromotion(
   repoConfig: RepoConfig,
   logger: Logger,
   cycleNumber: number
-): number {
+): "promoted" | "synced" | null {
   const repoName = repoConfig.name;
   const promoLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "promote" });
 
   // Main-only repos (like docs) don't have develop → main promotion
   if (repoConfig.baseBranch === "main" && repoConfig.featureBranch === "main") {
-    return 0;
+    return null;
   }
 
   const issues = findReadyForProdIssues(repoConfig.githubRepo, repoConfig.repoPath, promoLogger);
-  if (issues.length === 0) return 0;
+  if (issues.length === 0) return null;
 
   promoLogger.info(`Found ${issues.length} issue(s) ready for prod release`);
 
@@ -274,7 +277,7 @@ function tryPromotion(
   const existingPR = findOpenPromotionPR(repoConfig.githubRepo, "main", repoConfig.repoPath);
   if (existingPR) {
     promoLogger.warn(`Promotion PR already open — #${existingPR.number}: ${existingPR.url}`);
-    return 0;
+    return null;
   }
 
   // Check for branch drift (develop behind main due to merge commits)
@@ -286,16 +289,16 @@ function tryPromotion(
     const existingSyncPR = findOpenSyncPR(repoConfig.githubRepo, repoConfig.repoPath);
     if (existingSyncPR) {
       promoLogger.info(`Sync PR already open — #${existingSyncPR.number}: ${existingSyncPR.url}`);
-      return 0;
+      return null;
     }
 
     const syncUrl = createSyncPR(repoConfig.githubRepo, drift.developBehindMain, repoConfig.repoPath);
     if (syncUrl) {
       promoLogger.info(`Sync PR created: ${syncUrl} — promotion will retry after sync merges`);
-      return 1;
+      return "synced";
     } else {
       promoLogger.warn("Failed to create sync PR");
-      return 0;
+      return null;
     }
   }
 
@@ -310,9 +313,9 @@ function tryPromotion(
     promoLogger.info(`Promotion PR created: ${prUrl}`, {
       issues: issues.map((i) => i.number),
     });
-    return 1;
+    return "promoted";
   } else {
     promoLogger.warn("Failed to create promotion PR");
-    return 0;
+    return null;
   }
 }
