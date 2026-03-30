@@ -79,7 +79,7 @@ export async function runCycle(
           `Reconciled ${result.commitCount} orphaned commit(s) — PR created: ${result.prUrl}`,
           { issues: result.issueNumbers },
         );
-        events.push({ message: `Reconciled ${repoConfig.name} — PR: ${result.prUrl}`, level: "info" });
+        events.push({ message: `Reconciled ${repoConfig.name} (features → develop) — PR: ${result.prUrl}`, level: "info" });
         totalProcessed++;
       }
     } catch (err) {
@@ -93,7 +93,7 @@ export async function runCycle(
   for (const repoConfig of config.repos) {
     const revised = await tryRevision(repoConfig, logger, cycleNumber);
     if (revised) {
-      events.push({ message: `Revised PR on ${repoConfig.name} (review feedback)`, level: "info" });
+      events.push({ message: `Revised PR on ${repoConfig.name} (features → develop, review feedback)`, level: "info" });
       totalProcessed++;
     }
   }
@@ -111,7 +111,7 @@ export async function runCycle(
   for (const repoConfig of config.repos) {
     const promotionCount = tryPromotion(repoConfig, logger, cycleNumber);
     if (promotionCount > 0) {
-      events.push({ message: `Promotion PR created on ${repoConfig.name} (develop → main)`, level: "info" });
+      events.push({ message: `Production promotion PR created on ${repoConfig.name} (develop → main)`, level: "info" });
     }
     totalProcessed += promotionCount;
   }
@@ -187,7 +187,7 @@ async function tryBatchImplementation(
       lastFailureReason.delete(repoName);
       failureHitMaxAt.delete(repoName);
       repoLogger.info(`Batch implementation succeeded`, { prUrl: result.prUrl });
-      events?.push({ message: `Feature PR on ${repoName}: ${result.prUrl || "(commits added)"}`, level: "info" });
+      events?.push({ message: `Feature PR on ${repoName} (features → develop): ${result.prUrl || "(commits added)"}`, level: "info" });
     } else {
       const newCount = (failureCount.get(repoName) ?? 0) + 1;
       failureCount.set(repoName, newCount);
