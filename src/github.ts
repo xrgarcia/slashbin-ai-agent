@@ -154,6 +154,11 @@ export interface PendingRevisionPR {
   headRefName: string;
 }
 
+export interface PendingRevisionInfo {
+  issueNumbers: number[];
+  pr: PendingRevisionPR;
+}
+
 /**
  * Gate check: are there any issues with "pr pending actions" label?
  * These are issues where the reviewer requested changes on the linked PR
@@ -161,11 +166,13 @@ export interface PendingRevisionPR {
  *
  * The review workflow applies "pr pending actions" to the ISSUE (not the PR),
  * so we query issues and then confirm they have an open feature PR.
+ *
+ * Returns the pending revision details, or null if no work.
  */
-export function hasPendingRevisions(
+export function findPendingRevisions(
   config: RepoConfig,
   logger: Logger
-): boolean {
+): PendingRevisionInfo | null {
   try {
     // Find issues labeled "pr pending actions" + the trigger label (approved)
     const issueJson = gh([
@@ -179,7 +186,7 @@ export function hasPendingRevisions(
     ], config.repoPath);
 
     const issues: { number: number; title: string }[] = JSON.parse(issueJson || "[]");
-    if (issues.length === 0) return false;
+    if (issues.length === 0) return null;
 
     // Confirm there's an open feature PR (features → develop)
     const prJson = gh([
@@ -188,23 +195,56 @@ export function hasPendingRevisions(
       "--state", "open",
       "--head", config.featureBranch,
       "--base", config.baseBranch,
-      "--json", "number,url",
+      "--json", "number,url,headRefName",
       "--limit", "1",
     ], config.repoPath);
 
     const prs: PendingRevisionPR[] = JSON.parse(prJson || "[]");
     if (prs.length > 0) {
       logger.info(`Found ${issues.length} issue(s) pending revision with open PR #${prs[0].number}: ${issues.map(i => `#${i.number}`).join(", ")}`);
-      return true;
+      return { issueNumbers: issues.map(i => i.number), pr: prs[0] };
     }
 
     logger.debug(`Found ${issues.length} issue(s) with "pr pending actions" but no open feature PR`);
-    return false;
+    return null;
   } catch (err) {
     logger.error("Failed to check for pending revisions", {
       error: err instanceof Error ? err.message : String(err),
     });
-    return false;
+    return null;
+  }
+}
+
+/** Backwards-compatible boolean wrapper for the implement-phase gate. */
+export function hasPendingRevisions(
+  config: RepoConfig,
+  logger: Logger
+): boolean {
+  return findPendingRevisions(config, logger) !== null;
+}
+
+/**
+ * Transition issue labels after successful revision:
+ * remove "pr pending actions", add "pr under review".
+ */
+export function transitionRevisionLabels(
+  repo: string,
+  issueNumbers: number[],
+  cwd: string,
+  logger: Logger,
+): void {
+  for (const num of issueNumbers) {
+    try {
+      gh([
+        "issue", "edit", String(num),
+        "--repo", repo,
+        "--remove-label", "pr pending actions",
+        "--add-label", "pr under review",
+      ], cwd);
+      logger.info(`Transitioned issue #${num} labels: "pr pending actions" → "pr under review"`);
+    } catch (err) {
+      logger.warn(`Failed to transition labels on #${num}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 

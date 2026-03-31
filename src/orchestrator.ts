@@ -3,6 +3,8 @@ import type { Logger } from "./logger.js";
 import {
   findActionableIssues,
   hasPendingRevisions,
+  findPendingRevisions,
+  transitionRevisionLabels,
   findReadyForProdIssues,
   findOpenPromotionPR,
   createPromotionPR,
@@ -224,23 +226,37 @@ async function tryRevision(
     return false;
   }
 
-  // Gate: are there PRs with pending review feedback?
-  const hasWork = hasPendingRevisions(repoConfig, revLogger);
-  if (!hasWork) {
+  // Gate: are there issues with pending review feedback + an open feature PR?
+  const pending = findPendingRevisions(repoConfig, revLogger);
+  if (!pending) {
     if (failures > 0) revisionFailureCount.set(repoName, 0);
     return false;
   }
 
-  // Invoke the revision skill
+  // Invoke the revision skill with specific PR and issue context
   implementing = repoName;
   abortController = new AbortController();
-  revLogger.info(`Triggering PR revision for ${repoName}`);
+  revLogger.info(`Triggering PR revision for ${repoName} — PR #${pending.pr.number}, issues: ${pending.issueNumbers.map(n => `#${n}`).join(", ")}`);
 
   try {
-    const result = await revisePRFeedback(repoConfig, revLogger, abortController.signal);
+    const result = await revisePRFeedback(
+      repoConfig, revLogger, abortController.signal,
+      pending.pr.number, pending.issueNumbers,
+    );
 
     if (result.success) {
       revisionFailureCount.set(repoName, 0);
+
+      // Transition issue labels: "pr pending actions" → "pr under review"
+      // The orchestrator owns this because the skill runs in the service repo
+      // and may not have the right context to find the issue labels.
+      transitionRevisionLabels(
+        repoConfig.githubRepo,
+        pending.issueNumbers,
+        repoConfig.repoPath,
+        revLogger,
+      );
+
       revLogger.info("PR revision succeeded");
     } else {
       const newCount = failures + 1;

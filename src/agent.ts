@@ -220,26 +220,39 @@ Work autonomously. Do not ask questions.`;
 /**
  * Invoke Claude CLI to revise PRs that have review feedback ("pr pending actions").
  * The revision skill reads review comments, implements fixes, and pushes.
+ *
+ * The orchestrator passes the specific PR number and issue numbers so the
+ * skill doesn't need to search by label (which historically was unreliable).
  */
 export async function revisePRFeedback(
   config: RepoConfig,
   logger: Logger,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  prNumber?: number,
+  issueNumbers?: number[],
 ): Promise<RevisionResult> {
   logger.info(`Starting PR revision for ${config.name}`);
+
+  const prContext = prNumber
+    ? `\n\nCONTEXT: PR #${prNumber} needs revision. Linked issues: ${(issueNumbers || []).map(n => `#${n}`).join(", ")}. Read the review comments on PR #${prNumber} to understand what changes are requested.`
+    : "";
+
+  const labelNote = `\n\nIMPORTANT: Do NOT update issue labels — the orchestrator handles label transitions after you finish.`;
 
   let prompt: string;
 
   if (config.revisionSkillPath) {
-    prompt = `Read and follow the skill at ${config.revisionSkillPath}.\n\nRevise all PRs with pending review feedback for this repository. The skill defines the full workflow — follow it exactly.`;
+    prompt = `Read and follow the skill at ${config.revisionSkillPath}.\n\nRevise PR #${prNumber || "(pending)"} which has review feedback for this repository. The skill defines the full workflow — follow it exactly.${prContext}${labelNote}`;
   } else {
-    prompt = `Find all open PRs labeled "pr pending actions" in this repository.
+    prompt = `Revise PR #${prNumber || "(find open PRs with review feedback)"} in this repository.
 
-1. Query: gh pr list --label "pr pending actions" --state open --json number,title,url,headRefName
-2. For each PR, read all review comments: gh pr view <number> --comments
+1. Read the PR's review comments: gh pr view ${prNumber || "<number>"} --comments
+2. Also read inline review comments: gh api repos/${config.githubRepo}/pulls/${prNumber || "<number>"}/comments --jq '.[] | {path, line, body}'
 3. Implement the requested changes on the PR's branch.
-4. Commit fixes, push to the PR branch.
-5. Remove "pr pending actions" label and add "pr under review": gh pr edit <number> --remove-label "pr pending actions" --add-label "pr under review"
+4. Run tests: npm test
+5. Commit fixes with message: fix: address review feedback (#${prNumber || "<number>"})
+6. Push to the PR branch.
+${prContext}${labelNote}
 
 Work autonomously. Do not ask questions.`;
   }
