@@ -11,6 +11,7 @@ import {
   checkBranchDrift,
   findOpenSyncPR,
   createSyncPR,
+  type PendingRevisionInfo,
 } from "./github.js";
 import { implementApprovedIssues, revisePRFeedback, type ImplementationResult, type RevisionResult } from "./agent.js";
 import { reconcileRepo } from "./reconciler.js";
@@ -81,7 +82,7 @@ export async function runCycle(
           `Reconciled ${result.commitCount} orphaned commit(s) — PR created: ${result.prUrl}`,
           { issues: result.issueNumbers },
         );
-        events.push({ message: `Reconciled ${repoConfig.name} (features → develop) — PR: ${result.prUrl}`, level: "info" });
+        events.push({ message: `Reconciled ${repoConfig.githubRepo} — ${result.commitCount} orphaned commit(s), PR: ${result.prUrl}`, level: "info" });
         totalProcessed++;
       }
     } catch (err) {
@@ -93,9 +94,9 @@ export async function runCycle(
 
   // --- Phase 1: Revise PRs with pending review feedback ---
   for (const repoConfig of config.repos) {
-    const revised = await tryRevision(repoConfig, logger, cycleNumber);
-    if (revised) {
-      events.push({ message: `Revised PR on ${repoConfig.name} (features → develop, review feedback)`, level: "info" });
+    const revisionInfo = await tryRevision(repoConfig, logger, cycleNumber);
+    if (revisionInfo) {
+      events.push({ message: `Revised ${repoConfig.githubRepo} PR #${revisionInfo.pr.number} (issues: ${revisionInfo.issueNumbers.map(n => `#${n}`).join(", ")})`, level: "info" });
       totalProcessed++;
     }
   }
@@ -113,10 +114,10 @@ export async function runCycle(
   for (const repoConfig of config.repos) {
     const promotionResult = tryPromotion(repoConfig, logger, cycleNumber);
     if (promotionResult === "promoted") {
-      events.push({ message: `Production promotion PR created on ${repoConfig.name} (develop → main)`, level: "info" });
+      events.push({ message: `Promotion PR created on ${repoConfig.githubRepo} (develop → main)`, level: "info" });
       totalProcessed++;
     } else if (promotionResult === "synced") {
-      events.push({ message: `Branch sync PR created and merged on ${repoConfig.name} (main → develop) — promotion will follow`, level: "info" });
+      events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged, promotion will follow`, level: "info" });
       totalProcessed++;
     }
   }
@@ -163,7 +164,7 @@ async function tryBatchImplementation(
   }
 
   // Emit event: issues picked up
-  events?.push({ message: `Picked up ${actionableIssues.length} issue(s) on ${repoName}: ${actionableIssues.map(n => `#${n}`).join(", ")}`, level: "info" });
+  events?.push({ message: `Picked up ${actionableIssues.length} issue(s) on ${repoConfig.githubRepo}: ${actionableIssues.map(n => `#${n}`).join(", ")}`, level: "info" });
 
   // Gate: if there's a PR awaiting revision ("pr pending actions"), skip implementation.
   // The revision phase (Phase 1) handles these — running implementation would just
@@ -192,7 +193,7 @@ async function tryBatchImplementation(
       lastFailureReason.delete(repoName);
       failureHitMaxAt.delete(repoName);
       repoLogger.info(`Batch implementation succeeded`, { prUrl: result.prUrl });
-      events?.push({ message: `Feature PR on ${repoName} (features → develop): ${result.prUrl || "(commits added)"}`, level: "info" });
+      events?.push({ message: `Feature PR on ${repoConfig.githubRepo}: ${result.prUrl || "(commits added to existing PR)"}`, level: "info" });
     } else {
       const newCount = (failureCount.get(repoName) ?? 0) + 1;
       failureCount.set(repoName, newCount);
@@ -201,7 +202,7 @@ async function tryBatchImplementation(
       }
       lastFailureReason.set(repoName, result.error || "unknown");
       repoLogger.warn(`Batch implementation failed (${newCount}/${MAX_RETRIES}): ${result.error}`);
-      events?.push({ message: `Implementation failed on ${repoName}: ${result.error}`, level: "error" });
+      events?.push({ message: `Implementation failed on ${repoConfig.githubRepo}: ${result.error}`, level: "error" });
     }
 
     return result;
@@ -215,7 +216,7 @@ async function tryRevision(
   repoConfig: RepoConfig,
   logger: Logger,
   cycleNumber: number
-): Promise<boolean> {
+): Promise<PendingRevisionInfo | null> {
   const repoName = repoConfig.name;
   const revLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "revision" });
 
@@ -223,14 +224,14 @@ async function tryRevision(
   const failures = revisionFailureCount.get(repoName) ?? 0;
   if (failures >= MAX_RETRIES) {
     revLogger.debug(`Skipping ${repoName} revision — ${failures} consecutive failures`);
-    return false;
+    return null;
   }
 
   // Gate: are there issues with pending review feedback + an open feature PR?
   const pending = findPendingRevisions(repoConfig, revLogger);
   if (!pending) {
     if (failures > 0) revisionFailureCount.set(repoName, 0);
-    return false;
+    return null;
   }
 
   // Invoke the revision skill with specific PR and issue context
@@ -258,13 +259,14 @@ async function tryRevision(
       );
 
       revLogger.info("PR revision succeeded");
+      return pending;
     } else {
       const newCount = failures + 1;
       revisionFailureCount.set(repoName, newCount);
       revLogger.warn(`PR revision failed (${newCount}/${MAX_RETRIES}): ${result.error}`);
     }
 
-    return result.success;
+    return null;
   } finally {
     implementing = null;
     abortController = null;
