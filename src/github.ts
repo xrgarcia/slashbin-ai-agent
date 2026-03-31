@@ -155,29 +155,50 @@ export interface PendingRevisionPR {
 }
 
 /**
- * Gate check: are there any open PRs with "pr pending actions" label?
- * These are PRs where the reviewer requested changes and the Foreman
- * needs to revise the code.
+ * Gate check: are there any issues with "pr pending actions" label?
+ * These are issues where the reviewer requested changes on the linked PR
+ * and the Foreman needs to revise the code.
+ *
+ * The review workflow applies "pr pending actions" to the ISSUE (not the PR),
+ * so we query issues and then confirm they have an open feature PR.
  */
 export function hasPendingRevisions(
   config: RepoConfig,
   logger: Logger
 ): boolean {
   try {
-    const json = gh([
-      "pr", "list",
+    // Find issues labeled "pr pending actions" + the trigger label (approved)
+    const issueJson = gh([
+      "issue", "list",
       "--repo", config.githubRepo,
       "--state", "open",
       "--label", "pr pending actions",
-      "--json", "number,url,headRefName",
+      "--label", config.triggerLabel,
+      "--json", "number,title",
       "--limit", "100",
     ], config.repoPath);
 
-    const prs: PendingRevisionPR[] = JSON.parse(json || "[]");
+    const issues: { number: number; title: string }[] = JSON.parse(issueJson || "[]");
+    if (issues.length === 0) return false;
+
+    // Confirm there's an open feature PR (features → develop)
+    const prJson = gh([
+      "pr", "list",
+      "--repo", config.githubRepo,
+      "--state", "open",
+      "--head", config.featureBranch,
+      "--base", config.baseBranch,
+      "--json", "number,url",
+      "--limit", "1",
+    ], config.repoPath);
+
+    const prs: PendingRevisionPR[] = JSON.parse(prJson || "[]");
     if (prs.length > 0) {
-      logger.debug(`Found ${prs.length} PR(s) pending revision`);
+      logger.info(`Found ${issues.length} issue(s) pending revision with open PR #${prs[0].number}: ${issues.map(i => `#${i.number}`).join(", ")}`);
       return true;
     }
+
+    logger.debug(`Found ${issues.length} issue(s) with "pr pending actions" but no open feature PR`);
     return false;
   } catch (err) {
     logger.error("Failed to check for pending revisions", {
