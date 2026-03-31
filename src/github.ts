@@ -10,12 +10,16 @@ interface GhIssue {
   url: string;
 }
 
+/** Run gh CLI using the Foreman token (slashbin-foreman account). */
 export function gh(args: string[], cwd: string): string {
+  const foremanToken = process.env.FOREMAN_GITHUB_TOKEN;
+  if (!foremanToken) throw new Error("FOREMAN_GITHUB_TOKEN not set — cannot operate as Foreman");
   return execFileSync("gh", args, {
     cwd,
     encoding: "utf-8",
     stdio: ["pipe", "pipe", "pipe"],
     timeout: 30_000,
+    env: { ...process.env, GH_TOKEN: foremanToken },
   }).trim();
 }
 
@@ -450,7 +454,7 @@ export function findOpenSyncPR(
 
 /**
  * Create a sync PR to merge main back into develop, then immediately
- * approve + merge it. Created as xrgarcia (default token), approved
+ * approve + merge it. Created as slashbin-foreman (Foreman token), approved
  * and merged as slashbin-engineering-manager (EM token) to satisfy
  * branch protection's "no self-approval" rule.
  *
