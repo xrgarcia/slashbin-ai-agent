@@ -115,7 +115,19 @@ export async function runCycle(
     }
   }
 
-  // --- Phase 3: Create promotion PRs for repos with ready-for-prod issues ---
+  // --- Phase 3: Reconcile branch drift (main → develop) for any repo with
+  //    post-promotion merge commits. Runs independently of promotion work so
+  //    drift is cleared even when no ready-for-prod issues exist. ---
+  for (const repoConfig of config.repos) {
+    if (repoConfig.baseBranch === "main" && repoConfig.featureBranch === "main") continue;
+    const synced = trySyncDrift(repoConfig, logger, cycleNumber);
+    if (synced) {
+      events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged`, level: "info" });
+      totalProcessed++;
+    }
+  }
+
+  // --- Phase 4: Create promotion PRs for repos with ready-for-prod issues ---
   for (const repoConfig of config.repos) {
     const promotionResult = tryPromotion(repoConfig, logger, cycleNumber);
     if (promotionResult === "promoted") {
@@ -303,6 +315,32 @@ async function tryRevision(
   }
 }
 
+function trySyncDrift(
+  repoConfig: RepoConfig,
+  logger: Logger,
+  cycleNumber: number
+): boolean {
+  const syncLogger = logger.child({ cycle: cycleNumber, repo: repoConfig.name, phase: "sync" });
+
+  const drift = checkBranchDrift(repoConfig.githubRepo, repoConfig.repoPath, syncLogger);
+  if (!drift || drift.developBehindMain === 0) return false;
+
+  const existing = findOpenSyncPR(repoConfig.githubRepo, repoConfig.repoPath);
+  if (existing) {
+    syncLogger.info(`Sync PR already open — #${existing.number}: ${existing.url}`);
+    return false;
+  }
+
+  syncLogger.info(`develop is ${drift.developBehindMain} commit(s) behind main — creating sync PR`);
+  const syncUrl = createSyncPR(repoConfig.githubRepo, drift.developBehindMain, repoConfig.repoPath, syncLogger);
+  if (syncUrl) {
+    syncLogger.info(`Sync PR created and auto-merged: ${syncUrl}`);
+    return true;
+  }
+  syncLogger.warn("Failed to create sync PR");
+  return false;
+}
+
 function tryPromotion(
   repoConfig: RepoConfig,
   logger: Logger,
@@ -345,28 +383,6 @@ function tryPromotion(
       promoLogger.info(`Promotion PR #${existingPR.number} already includes all ${issues.length} issue(s)`);
     }
     return null;
-  }
-
-  // Check for branch drift (develop behind main due to merge commits)
-  const drift = checkBranchDrift(repoConfig.githubRepo, repoConfig.repoPath, promoLogger);
-  if (drift && drift.developBehindMain > 0) {
-    promoLogger.info(`develop is ${drift.developBehindMain} commit(s) behind main — sync required before promotion`);
-
-    // Check if a sync PR already exists
-    const existingSyncPR = findOpenSyncPR(repoConfig.githubRepo, repoConfig.repoPath);
-    if (existingSyncPR) {
-      promoLogger.info(`Sync PR already open — #${existingSyncPR.number}: ${existingSyncPR.url}`);
-      return null;
-    }
-
-    const syncUrl = createSyncPR(repoConfig.githubRepo, drift.developBehindMain, repoConfig.repoPath, promoLogger);
-    if (syncUrl) {
-      promoLogger.info(`Sync PR created and auto-merged: ${syncUrl}`);
-      return "synced";
-    } else {
-      promoLogger.warn("Failed to create sync PR");
-      return null;
-    }
   }
 
   // Guard: confirm develop actually has file changes main is missing before
