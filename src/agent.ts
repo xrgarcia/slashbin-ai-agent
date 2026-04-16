@@ -65,7 +65,7 @@ function spawnClaude(
 
     child = spawn("claude", args, {
       cwd: config.repoPath,
-      env: process.env as Record<string, string>,
+      env: { ...process.env, GH_TOKEN: process.env.FOREMAN_GITHUB_TOKEN } as Record<string, string>,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
