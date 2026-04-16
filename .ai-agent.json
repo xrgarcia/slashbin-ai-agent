@@ -6,7 +6,7 @@
       "githubRepo": "xrgarcia/slashbin-io-worker",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "gateway",
@@ -14,7 +14,7 @@
       "githubRepo": "xrgarcia/Slashbin-Ingest-Gateway",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "console",
@@ -22,7 +22,7 @@
       "githubRepo": "xrgarcia/Slashbin-console",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "cmneb-receiver",
@@ -30,7 +30,7 @@
       "githubRepo": "xrgarcia/cmneb_data_receiver",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "cmneb-publisher",
@@ -38,7 +38,7 @@
       "githubRepo": "xrgarcia/cmneb_data_publisher",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "docs",
@@ -46,7 +46,7 @@
       "githubRepo": "xrgarcia/Slashbin-io-docs",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "cmneb-hr",
@@ -54,7 +54,7 @@
       "githubRepo": "xrgarcia/cmneb_hr",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "cmneb-portal",
@@ -62,7 +62,7 @@
       "githubRepo": "xrgarcia/cmneb_portal",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     },
     {
       "name": "cli",
@@ -70,7 +70,7 @@
       "githubRepo": "xrgarcia/slashbin-cli",
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
-      "model": "claude-sonnet-4-7"
+      "model": "claude-sonnet-4-6"
     }
   ],
   "triggerLabel": "approved",
