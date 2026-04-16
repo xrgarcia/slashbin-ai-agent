@@ -1,5 +1,7 @@
 # slashbin-ai-foreman
 
+*The autonomous engineering delegator behind [www.slashbin.io](https://www.slashbin.io). Picks up issues, assigns work, ships PRs — no humans in the loop.*
+
 **Turn approved GitHub issues into shipped pull requests — autonomously.**
 
 The Foreman is an AI engineering agent that polls your repo, picks up approved work, implements it with [Claude Code](https://docs.anthropic.com/en/docs/claude-code), opens a PR, and responds to reviewer feedback. No manual intervention. Uses your CLI subscription — no per-run API costs.
@@ -34,7 +36,7 @@ The Foreman is one layer in an AI engineering pipeline:
 3. **Foreman** picks up approved issues, implements them, and opens PRs
 4. **Reviewers** (human or AI) provide feedback — Foreman revises automatically
 
-This is the pattern behind [slashbin.ai](https://slashbin.ai) — structured context in, autonomous execution out. The Foreman doesn't need to understand your business. It reads the issue, reads the repo's CLAUDE.md, and builds.
+This is the pattern behind [slashbin.io](https://www.slashbin.io) — structured context in, autonomous execution out. The Foreman doesn't need to understand your business. It reads the issue, reads the repo's CLAUDE.md, and builds.
 
 ## Quick start
 
