@@ -71,6 +71,14 @@
       "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
       "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
       "model": "claude-sonnet-4-6"
+    },
+    {
+      "name": "jerky-receiver",
+      "repoPath": "../jerky_data_receiver",
+      "githubRepo": "xrgarcia/jerky_data_receiver",
+      "skillPath": ".claude/skills/implement-approved-issues/SKILL.md",
+      "revisionSkillPath": ".claude/skills/revise-pr-feedback/SKILL.md",
+      "model": "claude-sonnet-4-6"
     }
   ],
   "triggerLabel": "approved",
