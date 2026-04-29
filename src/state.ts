@@ -6,9 +6,19 @@ interface FailedIssue {
   lastError: string;
 }
 
+interface SkippedIssue {
+  lastSkippedAt: string; // ISO timestamp
+  reason: string;
+}
+
 export interface RepoState {
   implemented: number[];
   failed: Record<number, FailedIssue>;
+  // Issues the implementation agent declined to implement (e.g., investigation-only
+  // issues whose body explicitly says "no immediate code change"). The orchestrator
+  // applies a back-off so we don't re-attempt every cycle.
+  // Optional for backward compat with v2 state files written before this field existed.
+  skipped?: Record<number, SkippedIssue>;
 }
 
 interface PersistedState {
@@ -44,6 +54,7 @@ function loadRaw(): PersistedState {
     const v1State: RepoState = {
       implemented: Array.isArray(parsed.implemented) ? parsed.implemented : [],
       failed: parsed.failed && typeof parsed.failed === "object" ? parsed.failed : {},
+      skipped: {},
     };
     return { version: 2, repos: { _migrated: v1State } };
   } catch {
@@ -67,6 +78,7 @@ export function loadRepoState(repoName: string): RepoState {
     return {
       implemented: [...repo.implemented],
       failed: { ...repo.failed },
+      skipped: { ...(repo.skipped ?? {}) },
     };
   }
 
@@ -79,12 +91,14 @@ export function loadRepoState(repoName: string): RepoState {
     return {
       implemented: [...migrated.implemented],
       failed: { ...migrated.failed },
+      skipped: { ...(migrated.skipped ?? {}) },
     };
   }
 
   return {
     implemented: [...EMPTY_REPO_STATE.implemented],
     failed: { ...EMPTY_REPO_STATE.failed },
+    skipped: {},
   };
 }
 

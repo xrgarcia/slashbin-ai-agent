@@ -12,6 +12,51 @@ export interface ImplementationResult {
   success: boolean;
   prUrl?: string;
   error?: string;
+  // True when the agent deliberately declined to implement (e.g., the issue body
+  // says "investigate first, no code change yet"). Distinguishes a clean no-op
+  // from a real implementation failure so the orchestrator can back off instead
+  // of treating it as a retryable error.
+  skipped?: boolean;
+  // Reason the agent gave for skipping, surfaced from its output.
+  skipReason?: string;
+  // Issues the agent decided to skip. Empty/undefined when no skip was detected.
+  skippedIssues?: number[];
+}
+
+// Detect a deliberate skip in the agent's output. Two signals, in order of
+// reliability:
+//  1. Structured trailer: `FOREMAN_RESULT: skipped reason="<text>"` — what we
+//     ask the skill to emit.
+//  2. Free-text heuristic: the agent wrote about "skipping" or "no immediate
+//     code change". Less precise but catches well-behaved agents that explained
+//     themselves without using the structured trailer.
+function detectSkipSignal(stdout: string): { skipped: boolean; reason?: string } {
+  // Structured trailer (preferred)
+  const structured = stdout.match(/FOREMAN_RESULT:\s*skipped(?:\s+reason="([^"]*)")?/i);
+  if (structured) {
+    return { skipped: true, reason: structured[1] || "no reason given" };
+  }
+
+  // Free-text heuristics on the last 2000 chars (agents tend to put the
+  // conclusion at the end of their output).
+  const tail = stdout.slice(-2000).toLowerCase();
+  const phrases = [
+    "skipped because",
+    "skipping this issue",
+    "no implementation needed",
+    "no immediate code change",
+    "cannot be implemented",
+    "no code change is warranted",
+    "issue body explicitly says",
+    "decided not to implement",
+    "declined to implement",
+  ];
+  for (const phrase of phrases) {
+    if (tail.includes(phrase)) {
+      return { skipped: true, reason: `output indicates skip ("${phrase}")` };
+    }
+  }
+  return { skipped: false };
 }
 
 interface SpawnResult {
@@ -135,6 +180,14 @@ IMPORTANT: In PR descriptions, use "Related to #N" — NEVER use "Closes #N" or 
 Work autonomously. Do not ask questions.`;
   }
 
+  // Skip-signaling protocol: an issue body may explicitly direct the agent NOT
+  // to implement (e.g., investigation-first, blocked on external verification).
+  // If the agent decides not to implement any of the assigned issues, it must
+  // end its output with a single line `FOREMAN_RESULT: skipped reason="<text>"`
+  // so the orchestrator can distinguish a deliberate no-op from a failed
+  // implementation attempt and back off accordingly.
+  prompt += `\n\nIMPORTANT — Skip protocol: If after reading an issue you conclude that the issue body explicitly directs you NOT to write code (investigation-first, "no immediate code change", waiting on external verification, etc.), do NOT create an empty PR or guess at a fix. Instead, end your output with this exact line and nothing after it:\n\nFOREMAN_RESULT: skipped reason="<one-line explanation>"\n\nThis tells the Foreman to back off rather than re-queue the issue every cycle. If at least one issue in the batch IS implementable, implement those normally and only skip the rest in your written conclusion (no trailer needed when at least one PR was created).`;
+
   // Third Way: if a prior attempt failed, include context so Claude can adapt
   if (priorFailureReason) {
     prompt += `\n\nIMPORTANT — PRIOR ATTEMPT FAILED: "${priorFailureReason}". Ensure you: (1) commit changes to the ${config.featureBranch} branch, (2) push to origin, (3) create a PR targeting ${config.baseBranch} using \`gh pr create\`. If a PR already exists, push new commits to it.`;
@@ -213,6 +266,25 @@ Work autonomously. Do not ask questions.`;
   if (existingPR) {
     logger.info("No new PR created, but existing feature PR found — treating as success (commits added to existing PR)");
     return { success: true };
+  }
+
+  // Before flagging "no PR" as a failure, check whether the agent deliberately
+  // chose not to implement (investigation-only issues, blocked-on-prod-verification,
+  // etc.). The orchestrator backs off on skip rather than retrying every cycle.
+  const skip = detectSkipSignal(result.stdout);
+  if (skip.skipped) {
+    logger.info(`Implementation skipped — agent declined to write code: ${skip.reason}`);
+    const outputTail = result.stdout.slice(-500).trim();
+    if (outputTail) {
+      logger.info("Claude output (last 500 chars):\n" + outputTail);
+    }
+    return {
+      success: false,
+      skipped: true,
+      skipReason: skip.reason,
+      skippedIssues: issueNumbers ?? [],
+      error: `skipped: ${skip.reason}`,
+    };
   }
 
   // Log Claude's output tail so we can diagnose why no PR was created

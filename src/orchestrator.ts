@@ -192,6 +192,31 @@ async function tryBatchImplementation(
     return null;
   }
 
+  // Filter out issues the agent recently chose to skip (investigation-only,
+  // blocked-on-external-verification, etc.). Back off for SKIP_BACKOFF_MS so
+  // we don't burn an agent run every cycle correctly doing nothing.
+  // Skipped entries are cleared automatically when the issue is re-implemented
+  // (success path) or when the back-off expires.
+  const skippedMap = repoState.skipped ?? {};
+  const SKIP_BACKOFF_MS = 30 * 60 * 1000; // 30 min
+  const now = Date.now();
+  const stillBackedOff: number[] = [];
+  actionableIssues = actionableIssues.filter((n) => {
+    const entry = skippedMap[n];
+    if (!entry) return true;
+    const age = now - new Date(entry.lastSkippedAt).getTime();
+    if (Number.isNaN(age) || age >= SKIP_BACKOFF_MS) return true;
+    stillBackedOff.push(n);
+    return false;
+  });
+  if (stillBackedOff.length > 0) {
+    repoLogger.debug(`Backing off ${stillBackedOff.length} previously-skipped issue(s): ${stillBackedOff.map(n => `#${n}`).join(", ")}`);
+  }
+  if (actionableIssues.length === 0) {
+    if (failures > 0) failureCount.set(repoName, 0);
+    return null;
+  }
+
   // Emit event: issues picked up
   events?.push({ message: `Picked up ${actionableIssues.length} issue(s) on ${repoConfig.githubRepo}: ${actionableIssues.map(n => `#${n}`).join(", ")}`, level: "info" });
 
@@ -228,6 +253,9 @@ async function tryBatchImplementation(
         if (!updatedState.implemented.includes(issueNum)) {
           updatedState.implemented.push(issueNum);
         }
+        // Clear any prior skip record — if it's now implemented, the prior
+        // "blocked on investigation" state is resolved.
+        if (updatedState.skipped) delete updatedState.skipped[issueNum];
       }
       saveRepoState(repoName, updatedState);
 
@@ -236,6 +264,28 @@ async function tryBatchImplementation(
 
       repoLogger.info(`Batch implementation succeeded — tracked ${actionableIssues.map(n => `#${n}`).join(", ")} in state`, { prUrl: result.prUrl });
       events?.push({ message: `Feature PR on ${repoConfig.githubRepo}: ${result.prUrl || "(commits added to existing PR)"}`, level: "info" });
+    } else if (result.skipped) {
+      // Deliberate no-op by the agent (e.g., issue body says "investigate first").
+      // Record per-issue skip timestamps so the back-off filter at the top of
+      // this function suppresses retries for SKIP_BACKOFF_MS.
+      // Do NOT increment failureCount — this isn't an error.
+      const updatedState = loadRepoState(repoName);
+      if (!updatedState.skipped) updatedState.skipped = {};
+      const skippedSet = result.skippedIssues && result.skippedIssues.length > 0
+        ? result.skippedIssues
+        : actionableIssues;
+      const reason = result.skipReason ?? "no reason given";
+      const stamp = new Date().toISOString();
+      for (const issueNum of skippedSet) {
+        updatedState.skipped[issueNum] = { lastSkippedAt: stamp, reason };
+      }
+      saveRepoState(repoName, updatedState);
+      // Reset the failure counter — an explicit skip is not a failure.
+      failureCount.set(repoName, 0);
+      lastFailureReason.delete(repoName);
+      failureHitMaxAt.delete(repoName);
+      repoLogger.info(`Batch implementation skipped by agent: ${reason} (issues: ${skippedSet.map(n => `#${n}`).join(", ")})`);
+      events?.push({ message: `Implementation skipped on ${repoConfig.githubRepo}: ${reason}`, level: "info" });
     } else {
       const newCount = (failureCount.get(repoName) ?? 0) + 1;
       failureCount.set(repoName, newCount);
