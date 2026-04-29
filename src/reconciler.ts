@@ -198,7 +198,7 @@ export function reconcileRepo(
       };
     }
 
-    const verified = verifyPRExists(config.githubRepo, branch, config.baseBranch, config.repoPath);
+    const verified = verifyPRExists(config.githubRepo, branch, config.baseBranch, config.repoPath, logger);
     if (!verified) {
       logger.warn("PR URL returned but verification failed — PR may not exist");
       return {

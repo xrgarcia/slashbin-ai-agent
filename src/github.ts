@@ -37,6 +37,30 @@ function ghAsEM(args: string[], cwd: string): string {
 }
 
 /**
+ * Extract the actionable bits of a thrown gh CLI error so callers can log
+ * something useful instead of swallowing the failure. execFileSync attaches
+ * `stderr` (Buffer) and `status` (exit code) to the Error it throws.
+ */
+interface GhFailure {
+  message: string;
+  stderr: string;
+  status: number | null;
+}
+
+function formatGhError(err: unknown): GhFailure {
+  const e = err as Error & { stderr?: Buffer | string; status?: number | null };
+  const stderr =
+    typeof e?.stderr === "string"
+      ? e.stderr
+      : e?.stderr?.toString() ?? "";
+  return {
+    message: e?.message ?? String(err),
+    stderr: stderr.trim(),
+    status: e?.status ?? null,
+  };
+}
+
+/**
  * Gate check: find approved issues that haven't progressed through
  * the lifecycle AND don't already have a PR. Returns the uncovered
  * issue numbers (capped to MAX_BATCH_SIZE), or empty array if none.
@@ -317,6 +341,7 @@ export function findOpenPromotionPR(
   repo: string,
   baseBranch: string,
   cwd: string,
+  logger?: Logger,
 ): OpenPromotionPR | null {
   try {
     const json = gh([
@@ -331,7 +356,8 @@ export function findOpenPromotionPR(
 
     const prs: OpenPromotionPR[] = JSON.parse(json || "[]");
     return prs.length > 0 ? prs[0] : null;
-  } catch {
+  } catch (err) {
+    logger?.warn("findOpenPromotionPR: gh pr list failed", { ...formatGhError(err) });
     return null;
   }
 }
@@ -434,6 +460,7 @@ export function createPromotionPR(
   baseBranch: string,
   issues: PromotionIssue[],
   cwd: string,
+  logger?: Logger,
 ): string | null {
   const issueList = issues
     .map((i) => `- #${i.number}: ${i.title}`)
@@ -464,7 +491,13 @@ Automated by slashbin-ai-agent`;
     // Extract PR URL from output
     const match = result.match(/https:\/\/github\.com\/[^\s]+/);
     return match ? match[0] : null;
-  } catch {
+  } catch (err) {
+    logger?.warn("createPromotionPR: gh pr create failed", {
+      ...formatGhError(err),
+      repo,
+      baseBranch,
+      issueNumbers: issues.map((i) => i.number),
+    });
     return null;
   }
 }
@@ -505,7 +538,8 @@ export function checkPRHasChanges(
 
     logger.info(`PR #${prs[0].number} modifies ${files.length} file(s): ${files.map((f: { path: string }) => f.path).join(", ")}`);
     return files.length;
-  } catch {
+  } catch (err) {
+    logger.warn("checkPRHasChanges: gh pr list failed", { ...formatGhError(err) });
     return -1;
   }
 }
@@ -551,6 +585,7 @@ export function checkBranchDrift(
 export function findOpenSyncPR(
   repo: string,
   cwd: string,
+  logger?: Logger,
 ): OpenPromotionPR | null {
   try {
     const json = gh([
@@ -565,7 +600,8 @@ export function findOpenSyncPR(
 
     const prs: OpenPromotionPR[] = JSON.parse(json || "[]");
     return prs.length > 0 ? prs[0] : null;
-  } catch {
+  } catch (err) {
+    logger?.warn("findOpenSyncPR: gh pr list failed", { ...formatGhError(err) });
     return null;
   }
 }
@@ -629,7 +665,8 @@ export function createSyncPR(
     }
 
     return prUrl;
-  } catch {
+  } catch (err) {
+    logger?.warn("createSyncPR: gh pr create failed", { ...formatGhError(err), repo, behindBy });
     return null;
   }
 }
@@ -641,6 +678,7 @@ export function verifyPRExists(
   headBranch: string,
   baseBranch: string,
   cwd: string,
+  logger?: Logger,
 ): boolean {
   try {
     const json = gh([
@@ -654,7 +692,8 @@ export function verifyPRExists(
     ], cwd);
     const prs = JSON.parse(json || "[]");
     return prs.length > 0;
-  } catch {
+  } catch (err) {
+    logger?.warn("verifyPRExists: gh pr list failed", { ...formatGhError(err), repo, headBranch, baseBranch });
     return false;
   }
 }

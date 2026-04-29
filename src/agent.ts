@@ -185,6 +185,7 @@ Work autonomously. Do not ask questions.`;
       config.featureBranch,
       config.baseBranch,
       config.repoPath,
+      logger,
     );
     if (!verified) {
       logger.warn("PR URL found but verification failed — PR may not exist on GitHub");
@@ -207,6 +208,7 @@ Work autonomously. Do not ask questions.`;
     config.featureBranch,
     config.baseBranch,
     config.repoPath,
+    logger,
   );
   if (existingPR) {
     logger.info("No new PR created, but existing feature PR found — treating as success (commits added to existing PR)");

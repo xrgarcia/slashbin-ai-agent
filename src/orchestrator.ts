@@ -325,7 +325,7 @@ function trySyncDrift(
   const drift = checkBranchDrift(repoConfig.githubRepo, repoConfig.repoPath, syncLogger);
   if (!drift || drift.developBehindMain === 0) return false;
 
-  const existing = findOpenSyncPR(repoConfig.githubRepo, repoConfig.repoPath);
+  const existing = findOpenSyncPR(repoConfig.githubRepo, repoConfig.repoPath, syncLogger);
   if (existing) {
     syncLogger.info(`Sync PR already open — #${existing.number}: ${existing.url}`);
     return false;
@@ -360,7 +360,7 @@ function tryPromotion(
   promoLogger.info(`Found ${issues.length} issue(s) ready for prod release`);
 
   // Check if a promotion PR already exists
-  const existingPR = findOpenPromotionPR(repoConfig.githubRepo, "main", repoConfig.repoPath);
+  const existingPR = findOpenPromotionPR(repoConfig.githubRepo, "main", repoConfig.repoPath, promoLogger);
   if (existingPR) {
     // Check if the PR body is missing any current ready-for-prod issues
     const listedIssues = new Set(
@@ -408,6 +408,7 @@ function tryPromotion(
     "main",
     issues,
     repoConfig.repoPath,
+    promoLogger,
   );
 
   if (prUrl) {
