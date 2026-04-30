@@ -1,8 +1,10 @@
 # slashbin-ai-foreman
 
-*The autonomous engineering delegator behind [www.slashbin.io](https://www.slashbin.io). Picks up approved issues, invokes implementation skills on service repos, ships PRs, and responds to review feedback.*
+**The autonomous engineering delegator behind [slashbin.io](https://www.slashbin.io?utm_source=github&utm_medium=readme&utm_campaign=ai-foreman) — the webhook ETL gateway for engineers and AI agents. [Try slashbin.io free →](https://www.slashbin.io?utm_source=github&utm_medium=readme&utm_campaign=ai-foreman)**
 
 **Turn approved GitHub issues into shipped pull requests — autonomously.**
+
+*Picks up approved issues, invokes implementation skills on service repos, ships PRs, and responds to review feedback.*
 
 The Foreman is an AI engineering agent that polls your repos for approved work, invokes a Claude Code skill (e.g. `/implement-approved-issues`) on each service repo, opens PRs, and revises based on reviewer feedback. Reviewers — human or AI — stay in the loop via PR reviews. Uses your CLI subscription — no per-run API costs.
 
@@ -46,7 +48,7 @@ The Foreman is one layer in an AI engineering pipeline:
 
 The Foreman uses a **dual-token model**: one GitHub token for its own operations (creating PRs, managing labels) and a second token for the Engineering Manager (approving and merging PRs that require branch protection). This prevents the Foreman from self-approving its own work.
 
-This is the pattern behind [www.slashbin.io](https://www.slashbin.io) — structured context in, autonomous execution out. The Foreman doesn't need to understand your business. It reads the issue, reads the repo's CLAUDE.md, and invokes the skill.
+This is the pattern behind [www.slashbin.io](https://www.slashbin.io?utm_source=github&utm_medium=readme&utm_campaign=ai-foreman_body) — structured context in, autonomous execution out. The Foreman doesn't need to understand your business. It reads the issue, reads the repo's CLAUDE.md, and invokes the skill.
 
 ## Quick start
 
