@@ -544,6 +544,31 @@ export function checkPRHasChanges(
   }
 }
 
+/**
+ * Read the current HEAD SHA of a remote branch via the GitHub API.
+ * Returns null on lookup failure so callers can decide how to react —
+ * a transient gh error should not be conflated with a real "branch unchanged"
+ * signal.
+ */
+export function getRemoteBranchSha(
+  repo: string,
+  branch: string,
+  cwd: string,
+  logger: Logger,
+): string | null {
+  try {
+    const sha = gh([
+      "api",
+      `repos/${repo}/branches/${encodeURIComponent(branch)}`,
+      "--jq", ".commit.sha",
+    ], cwd);
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch (err) {
+    logger.warn("getRemoteBranchSha: gh api failed", { ...formatGhError(err), repo, branch });
+    return null;
+  }
+}
+
 // --- Branch Sync ---
 
 export interface BranchDrift {

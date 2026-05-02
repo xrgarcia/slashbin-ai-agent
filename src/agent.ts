@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type { RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
-import { verifyPRExists, checkPRHasChanges } from "./github.js";
+import { verifyPRExists, checkPRHasChanges, getRemoteBranchSha } from "./github.js";
 
 export interface RevisionResult {
   success: boolean;
@@ -313,6 +313,13 @@ export async function revisePRFeedback(
 ): Promise<RevisionResult> {
   logger.info(`Starting PR revision for ${config.name}`);
 
+  // Capture the feature branch's HEAD SHA before invoking Claude so we can
+  // detect the no-op case where Claude exits 0 without pushing any commits.
+  // Without this, a silent no-op would be reported as success and the
+  // orchestrator would (incorrectly) transition labels to "pr under review",
+  // hiding the fact that the requested fix was never applied.
+  const beforeSha = getRemoteBranchSha(config.githubRepo, config.featureBranch, config.repoPath, logger);
+
   const prContext = prNumber
     ? `\n\nCONTEXT: PR #${prNumber} needs revision. Linked issues: ${(issueNumbers || []).map(n => `#${n}`).join(", ")}. Read the review comments on PR #${prNumber} to understand what changes are requested.`
     : "";
@@ -349,6 +356,25 @@ Work autonomously. Do not ask questions.`;
     const error = stderrMsg || stdoutTail || `exit code ${result.exitCode}`;
     logger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
+  }
+
+  // Post-revision self-check: confirm Claude actually pushed commits to the
+  // feature branch. A clean exit with no SHA change means the revision was a
+  // silent no-op (skill misfire, agent decided "nothing to fix", failed push,
+  // etc.). Treat it as a failure so the orchestrator does not transition labels
+  // to "pr under review" — that would lie about the PR's state and cause the
+  // EM to re-review unchanged code.
+  //
+  // Conservative on lookup failures: if either SHA is null (transient gh
+  // error), we trust the exit code rather than fail spuriously.
+  const afterSha = getRemoteBranchSha(config.githubRepo, config.featureBranch, config.repoPath, logger);
+  if (beforeSha && afterSha && beforeSha === afterSha) {
+    const outputTail = result.stdout.slice(-500).trim();
+    if (outputTail) {
+      logger.warn("Claude output (last 500 chars):\n" + outputTail);
+    }
+    logger.error(`PR revision completed (exit 0) but no commits were pushed to ${config.featureBranch} (SHA unchanged at ${beforeSha.slice(0, 10)}) — marking as failed`);
+    return { success: false, error: "no commits pushed — revision was a no-op" };
   }
 
   logger.info(`PR revision completed successfully for ${config.name}`);
