@@ -723,3 +723,69 @@ export function verifyPRExists(
   }
 }
 
+/**
+ * Read the open feature PR's body + title + commit messages and extract every
+ * issue number referenced via standard GitHub keywords ("Related to #N",
+ * "Closes #N", "Fixes #N", "Resolves #N", "Refs #N", "See #N"). Used by the
+ * orchestrator to know which subset of `actionableIssues` the implementation
+ * skill actually addressed — under the canonical one-issue-per-invocation
+ * skill (jerky_data_receiver#43 and friends), the skill picks one issue from a
+ * batch but the orchestrator must NOT label the unpicked issues as
+ * "pr under review", or they get stuck waiting forever for revision activity.
+ *
+ * Returns the parsed issue numbers (deduped). On lookup or parse failure
+ * returns null so callers can fall back to existing behavior rather than
+ * silently dropping issues from the label transition.
+ */
+export function getReferencedIssuesFromOpenPR(
+  repo: string,
+  headBranch: string,
+  baseBranch: string,
+  cwd: string,
+  logger?: Logger,
+): number[] | null {
+  try {
+    const json = gh([
+      "pr", "list",
+      "--repo", repo,
+      "--head", headBranch,
+      "--base", baseBranch,
+      "--state", "open",
+      "--json", "number,title,body,commits",
+      "--limit", "1",
+    ], cwd);
+    const prs = JSON.parse(json || "[]");
+    if (prs.length === 0) return null;
+    const pr = prs[0];
+
+    // Aggregate every text source the implementation skill might have used to
+    // reference the issue: PR title (`feat: foo (#N)`), PR body (`Related to #N`,
+    // `Closes #N`, etc.), and each commit message in the PR.
+    const sources: string[] = [pr.title || "", pr.body || ""];
+    for (const c of pr.commits || []) {
+      sources.push(c.messageHeadline || "");
+      sources.push(c.messageBody || "");
+    }
+    const text = sources.join("\n");
+
+    // Match keywords + optional `to`/`:` + `#<number>`. Case-insensitive.
+    // Also catches the trailing `(#N)` style commonly written by the canonical
+    // implement-approved-issues skill in PR titles.
+    const found = new Set<number>();
+    const keywordRe = /\b(?:related\s+to|closes?|fixes?|resolves?|refs?|see)\s*:?\s*#(\d+)/gi;
+    const titleSuffixRe = /\(#(\d+)\)/g;
+    for (const m of text.matchAll(keywordRe)) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n)) found.add(n);
+    }
+    for (const m of text.matchAll(titleSuffixRe)) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n)) found.add(n);
+    }
+    return Array.from(found).sort((a, b) => a - b);
+  } catch (err) {
+    logger?.warn("getReferencedIssuesFromOpenPR: gh pr list failed", { ...formatGhError(err), repo, headBranch, baseBranch });
+    return null;
+  }
+}
+
