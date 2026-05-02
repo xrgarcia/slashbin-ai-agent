@@ -6,6 +6,7 @@ import {
   findPendingRevisions,
   transitionRevisionLabels,
   transitionImplementationLabels,
+  getReferencedIssuesFromOpenPR,
   findReadyForProdIssues,
   findOpenPromotionPR,
   createPromotionPR,
@@ -247,9 +248,49 @@ async function tryBatchImplementation(
       lastFailureReason.delete(repoName);
       failureHitMaxAt.delete(repoName);
 
+      // Filter the discovered batch to only issues the implementation skill
+      // actually addressed in the resulting PR. The canonical
+      // implement-approved-issues skill picks ONE issue per invocation
+      // (jerky_data_receiver#43 / PR #44) — labeling all N discovered issues
+      // as "pr under review" wedges the unpicked ones forever (they look like
+      // they have a PR open but the PR doesn't reference them, so revision
+      // never fires). Parse the open PR's body + title + commits for keyword
+      // references and intersect with the discovery list.
+      //
+      // Conservative on lookup failure: if the parser returns null (gh error)
+      // OR returns zero referenced issues from the discovery batch (skill
+      // shipped something but didn't reference any of them, e.g. legacy
+      // bundling pre-#43), fall back to the discovery list and keep the
+      // existing behavior. The fallback path matches what we did before this
+      // fix — it's the SAFE direction (over-label, EM cleans up) versus
+      // under-labeling (issues stuck silent).
+      const referencedAll = getReferencedIssuesFromOpenPR(
+        repoConfig.githubRepo,
+        repoConfig.featureBranch,
+        repoConfig.baseBranch,
+        repoConfig.repoPath,
+        repoLogger,
+      );
+      const intersected = referencedAll
+        ? actionableIssues.filter((n) => referencedAll.includes(n))
+        : null;
+      const issuesActuallyImplemented =
+        intersected && intersected.length > 0 ? intersected : actionableIssues;
+      if (intersected && intersected.length > 0 && intersected.length < actionableIssues.length) {
+        const dropped = actionableIssues.filter((n) => !intersected.includes(n));
+        repoLogger.info(
+          `Skill implemented ${intersected.length}/${actionableIssues.length} discovered issues — labeling only the implemented set`,
+          { implemented: intersected, deferred: dropped },
+        );
+      } else if (intersected && intersected.length === 0) {
+        repoLogger.warn(
+          `Open PR found but its body/title/commits do not reference any discovered issue (#${actionableIssues.join(", #")}) — falling back to label all discovered issues; investigate the skill's PR formatting`,
+        );
+      }
+
       // Persist implemented issue numbers to prevent re-implementation loops
       const updatedState = loadRepoState(repoName);
-      for (const issueNum of actionableIssues) {
+      for (const issueNum of issuesActuallyImplemented) {
         if (!updatedState.implemented.includes(issueNum)) {
           updatedState.implemented.push(issueNum);
         }
@@ -260,9 +301,9 @@ async function tryBatchImplementation(
       saveRepoState(repoName, updatedState);
 
       // Add "pr under review" label so EM knows PRs are ready for review
-      transitionImplementationLabels(repoConfig.githubRepo, actionableIssues, repoConfig.repoPath, repoLogger);
+      transitionImplementationLabels(repoConfig.githubRepo, issuesActuallyImplemented, repoConfig.repoPath, repoLogger);
 
-      repoLogger.info(`Batch implementation succeeded — tracked ${actionableIssues.map(n => `#${n}`).join(", ")} in state`, { prUrl: result.prUrl });
+      repoLogger.info(`Batch implementation succeeded — tracked ${issuesActuallyImplemented.map(n => `#${n}`).join(", ")} in state`, { prUrl: result.prUrl });
       events?.push({ message: `Feature PR on ${repoConfig.githubRepo}: ${result.prUrl || "(commits added to existing PR)"}`, level: "info" });
     } else if (result.skipped) {
       // Deliberate no-op by the agent (e.g., issue body says "investigate first").
