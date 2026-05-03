@@ -250,20 +250,28 @@ async function tryBatchImplementation(
 
       // Filter the discovered batch to only issues the implementation skill
       // actually addressed in the resulting PR. The canonical
-      // implement-approved-issues skill picks ONE issue per invocation
-      // (jerky_data_receiver#43 / PR #44) — labeling all N discovered issues
-      // as "pr under review" wedges the unpicked ones forever (they look like
-      // they have a PR open but the PR doesn't reference them, so revision
-      // never fires). Parse the open PR's body + title + commits for keyword
-      // references and intersect with the discovery list.
+      // implement-approved-issues skill picks ONE issue per invocation —
+      // labeling all N discovered issues as "pr under review" wedges the
+      // unpicked ones forever (they look like they have a PR open but the
+      // PR doesn't reference them, so revision never fires). Parse the open
+      // PR's body + title + commits for keyword references and intersect
+      // with the discovery list.
       //
-      // Conservative on lookup failure: if the parser returns null (gh error)
-      // OR returns zero referenced issues from the discovery batch (skill
-      // shipped something but didn't reference any of them, e.g. legacy
-      // bundling pre-#43), fall back to the discovery list and keep the
-      // existing behavior. The fallback path matches what we did before this
-      // fix — it's the SAFE direction (over-label, EM cleans up) versus
-      // under-labeling (issues stuck silent).
+      // Three cases:
+      //   1. intersected.length > 0 → label only the matched subset (the
+      //      typical canonical-skill case).
+      //   2. intersected === null (gh lookup failed) → conservative fallback:
+      //      label the full discovery batch, since we can't tell what shipped.
+      //      Over-labeling is recoverable (EM cleanup); under-labeling stalls.
+      //   3. intersected.length === 0 (parser succeeded, found zero matches)
+      //      → SKIP labeling + state-update entirely. The open PR exists but
+      //      doesn't reference any discovery-batch issue, which means the
+      //      skill either reported success in error (found a stale PR for a
+      //      different issue) or its PR formatting omitted the references.
+      //      Labeling here would create a self-locked issue (state filter
+      //      sees it as `implemented`, no real PR to revise) and require
+      //      manual EM cleanup on every cycle. Leave issues unlocked for the
+      //      next cycle to retry from a clean state. (slashbin-ai-foreman#16)
       const referencedAll = getReferencedIssuesFromOpenPR(
         repoConfig.githubRepo,
         repoConfig.featureBranch,
@@ -274,6 +282,16 @@ async function tryBatchImplementation(
       const intersected = referencedAll
         ? actionableIssues.filter((n) => referencedAll.includes(n))
         : null;
+
+      if (intersected !== null && intersected.length === 0) {
+        // Case 3: empty intersection — skip labeling + state-update, log
+        // warning, exit cleanly. Next cycle re-discovers and retries.
+        repoLogger.warn(
+          `Open PR found but its body/title/commits do not reference any discovered issue (#${actionableIssues.join(", #")}) — skipping label + state update so the next cycle can retry. Investigate the skill's PR formatting if this recurs.`,
+        );
+        return null;
+      }
+
       const issuesActuallyImplemented =
         intersected && intersected.length > 0 ? intersected : actionableIssues;
       if (intersected && intersected.length > 0 && intersected.length < actionableIssues.length) {
@@ -282,9 +300,9 @@ async function tryBatchImplementation(
           `Skill implemented ${intersected.length}/${actionableIssues.length} discovered issues — labeling only the implemented set`,
           { implemented: intersected, deferred: dropped },
         );
-      } else if (intersected && intersected.length === 0) {
+      } else if (intersected === null) {
         repoLogger.warn(
-          `Open PR found but its body/title/commits do not reference any discovered issue (#${actionableIssues.join(", #")}) — falling back to label all discovered issues; investigate the skill's PR formatting`,
+          `getReferencedIssuesFromOpenPR returned null (lookup failed) — labeling full discovery batch as conservative fallback (#${actionableIssues.join(", #")})`,
         );
       }
 
