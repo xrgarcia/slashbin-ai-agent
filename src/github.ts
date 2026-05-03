@@ -61,6 +61,68 @@ function formatGhError(err: unknown): GhFailure {
 }
 
 /**
+ * Return all `approved` open issues in the repo that have not yet
+ * progressed through the lifecycle (no `pr under review` / `pr approved` /
+ * `pr pending actions` / `ready for prod release` / `ready to close`
+ * label, not `blocked`). This is the same filter `findActionableIssues`
+ * applies BEFORE the PR-uncovered cross-check + batch cap — i.e. the
+ * full set of issues that the implementation skill might pick this cycle.
+ *
+ * Used by the orchestrator's labeling step to widen the intersection of
+ * "issues referenced by the new PR" with "issues that should accept
+ * `pr under review`": the canonical skill makes its OWN selection from
+ * the entire approved set (priority + smaller-scope-first), which can
+ * differ from the Foreman's discovery batch (PR-uncovered subset, capped
+ * at MAX_BATCH_SIZE). Without this widening, when the skill picks an
+ * approved issue that wasn't in the discovery batch, the resulting PR
+ * gets a real merge but no `pr under review` label, leaving the EM with
+ * no signal. (slashbin-ai-foreman#18)
+ *
+ * Returns [] on any gh failure (treat as "nothing to widen to" rather
+ * than throwing — the caller already has the discovery batch as a
+ * fallback, and a labeling miss is recoverable).
+ */
+export function findAllApprovedActionableIssues(
+  config: RepoConfig,
+  logger: Logger,
+): number[] {
+  const repo = config.githubRepo;
+  try {
+    const json = gh([
+      "issue", "list",
+      "--repo", repo,
+      "--state", "open",
+      "--label", config.triggerLabel,
+      "--json", "number,labels",
+      "--limit", "100",
+    ], config.repoPath);
+    const issues: GhIssue[] = JSON.parse(json || "[]");
+
+    const lifecycleLabels = [
+      "pr under review",
+      "pr approved",
+      "pr pending actions",
+      "ready for prod release",
+      "ready to close",
+    ];
+
+    const actionable: number[] = [];
+    for (const issue of issues) {
+      const labels = issue.labels.map((l) => l.name);
+      if (labels.includes("blocked")) continue;
+      if (lifecycleLabels.some((l) => labels.includes(l))) continue;
+      actionable.push(issue.number);
+    }
+    return actionable;
+  } catch (err) {
+    logger.warn("findAllApprovedActionableIssues failed; returning [] (labeling will fall back to discovery batch)", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+/**
  * Gate check: find approved issues that haven't progressed through
  * the lifecycle AND don't already have a PR. Returns the uncovered
  * issue numbers (capped to MAX_BATCH_SIZE), or empty array if none.

@@ -2,6 +2,7 @@ import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import {
   findActionableIssues,
+  findAllApprovedActionableIssues,
   hasPendingRevisions,
   findPendingRevisions,
   transitionRevisionLabels,
@@ -248,30 +249,31 @@ async function tryBatchImplementation(
       lastFailureReason.delete(repoName);
       failureHitMaxAt.delete(repoName);
 
-      // Filter the discovered batch to only issues the implementation skill
-      // actually addressed in the resulting PR. The canonical
-      // implement-approved-issues skill picks ONE issue per invocation —
-      // labeling all N discovered issues as "pr under review" wedges the
-      // unpicked ones forever (they look like they have a PR open but the
-      // PR doesn't reference them, so revision never fires). Parse the open
-      // PR's body + title + commits for keyword references and intersect
-      // with the discovery list.
+      // Filter to only issues the implementation skill actually addressed in
+      // the resulting PR. The canonical implement-approved-issues skill picks
+      // ONE issue per invocation, AND it picks from the entire approved set
+      // (priority + smaller-scope-first), not necessarily from the Foreman's
+      // discovery batch. So the labeling-eligible set is the broader
+      // "all-approved-and-actionable" set — not just `actionableIssues`
+      // (which is also PR-uncovered + capped at MAX_BATCH_SIZE).
       //
-      // Three cases:
-      //   1. intersected.length > 0 → label only the matched subset (the
-      //      typical canonical-skill case).
-      //   2. intersected === null (gh lookup failed) → conservative fallback:
-      //      label the full discovery batch, since we can't tell what shipped.
-      //      Over-labeling is recoverable (EM cleanup); under-labeling stalls.
-      //   3. intersected.length === 0 (parser succeeded, found zero matches)
-      //      → SKIP labeling + state-update entirely. The open PR exists but
-      //      doesn't reference any discovery-batch issue, which means the
-      //      skill either reported success in error (found a stale PR for a
-      //      different issue) or its PR formatting omitted the references.
-      //      Labeling here would create a self-locked issue (state filter
-      //      sees it as `implemented`, no real PR to revise) and require
-      //      manual EM cleanup on every cycle. Leave issues unlocked for the
-      //      next cycle to retry from a clean state. (slashbin-ai-foreman#16)
+      // Three cases for the intersection of `referencedAll ∩ allActionable`:
+      //   1. matched.length > 0 → label the matched subset.
+      //   2. referencedAll === null (gh lookup failed) → conservative
+      //      fallback: label the discovery batch (`actionableIssues`), since
+      //      we can't tell what shipped. Over-labeling is recoverable (EM
+      //      cleanup); under-labeling stalls.
+      //   3. matched.length === 0 (parser succeeded, found zero matches in
+      //      the broader actionable set) → SKIP labeling + state-update
+      //      entirely. The open PR exists but doesn't reference any
+      //      currently-actionable approved issue. Labeling discovery-batch
+      //      issues here would create self-locked issues (state filter sees
+      //      them as `implemented`, no real PR to revise), requiring manual
+      //      EM cleanup every cycle. (slashbin-ai-foreman#16)
+      //
+      // Widening to allActionable (vs just actionableIssues) is the
+      // slashbin-ai-foreman#18 fix: if the skill picked an out-of-batch
+      // approved issue, the resulting PR still gets correctly labeled.
       const referencedAll = getReferencedIssuesFromOpenPR(
         repoConfig.githubRepo,
         repoConfig.featureBranch,
@@ -279,28 +281,39 @@ async function tryBatchImplementation(
         repoConfig.repoPath,
         repoLogger,
       );
-      const intersected = referencedAll
-        ? actionableIssues.filter((n) => referencedAll.includes(n))
+      const allActionable = findAllApprovedActionableIssues(repoConfig, repoLogger);
+      const labelingCandidates = Array.from(new Set([...actionableIssues, ...allActionable]));
+      const matched = referencedAll
+        ? labelingCandidates.filter((n) => referencedAll.includes(n))
         : null;
 
-      if (intersected !== null && intersected.length === 0) {
+      if (matched !== null && matched.length === 0) {
         // Case 3: empty intersection — skip labeling + state-update, log
         // warning, exit cleanly. Next cycle re-discovers and retries.
         repoLogger.warn(
-          `Open PR found but its body/title/commits do not reference any discovered issue (#${actionableIssues.join(", #")}) — skipping label + state update so the next cycle can retry. Investigate the skill's PR formatting if this recurs.`,
+          `Open PR found but its body/title/commits do not reference any actionable approved issue (discovery batch: #${actionableIssues.join(", #")}; broader set: #${labelingCandidates.join(", #")}) — skipping label + state update so the next cycle can retry. Investigate the skill's PR formatting if this recurs.`,
         );
         return null;
       }
 
       const issuesActuallyImplemented =
-        intersected && intersected.length > 0 ? intersected : actionableIssues;
-      if (intersected && intersected.length > 0 && intersected.length < actionableIssues.length) {
-        const dropped = actionableIssues.filter((n) => !intersected.includes(n));
-        repoLogger.info(
-          `Skill implemented ${intersected.length}/${actionableIssues.length} discovered issues — labeling only the implemented set`,
-          { implemented: intersected, deferred: dropped },
-        );
-      } else if (intersected === null) {
+        matched && matched.length > 0 ? matched : actionableIssues;
+      if (matched && matched.length > 0) {
+        const fromBatch = matched.filter((n) => actionableIssues.includes(n));
+        const fromBroader = matched.filter((n) => !actionableIssues.includes(n));
+        const dropped = actionableIssues.filter((n) => !matched.includes(n));
+        if (fromBroader.length > 0) {
+          repoLogger.info(
+            `Skill implemented ${matched.length} issue(s) — ${fromBatch.length} from discovery batch, ${fromBroader.length} from broader actionable set (skill priority differs from Foreman batch order)`,
+            { implemented: matched, fromBatch, fromBroader, deferred: dropped },
+          );
+        } else if (matched.length < actionableIssues.length) {
+          repoLogger.info(
+            `Skill implemented ${matched.length}/${actionableIssues.length} discovered issues — labeling only the implemented set`,
+            { implemented: matched, deferred: dropped },
+          );
+        }
+      } else if (referencedAll === null) {
         repoLogger.warn(
           `getReferencedIssuesFromOpenPR returned null (lookup failed) — labeling full discovery batch as conservative fallback (#${actionableIssues.join(", #")})`,
         );
