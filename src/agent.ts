@@ -66,6 +66,21 @@ interface SpawnResult {
   timedOut: boolean;
 }
 
+// Claude is multimodal — when issue bodies or PR review comments include
+// markdown image references like ![alt](url), the agent must fetch each image
+// to a local file and Read it. Without this, the model sees only the URL string
+// and is blind to visual specs (mockups, screenshots, walkthrough frames).
+//
+// Authorization header is required for private-repo URLs
+// (e.g. github.com/<owner>/<repo>/raw/<branch>/<path>) and harmless for public
+// CDN URLs (e.g. github.com/user-attachments/...).
+const IMAGE_HANDLING_INSTRUCTIONS = `IMAGE HANDLING: If an issue body or PR review comment contains markdown image references like \`![alt](https://...)\`, those images are part of the spec. Fetch each image to a temp file and Read it so you can see it:
+
+  curl -sL -H "Authorization: token $GH_TOKEN" -o /tmp/foreman-image-<n>.png "<url>"
+  Then call the Read tool on /tmp/foreman-image-<n>.png — the multimodal model will see the image content.
+
+The Authorization header is required for private-repo URLs (github.com/.../raw/...) and harmless for public CDN URLs (github.com/user-attachments/...). If a fetch fails, log a warning and proceed with the text spec — do not abort the implementation.`;
+
 function spawnClaude(
   prompt: string,
   config: RepoConfig,
@@ -162,8 +177,10 @@ export async function implementApprovedIssues(
   let prompt: string;
 
   if (config.skillPath) {
-    prompt = `Read and follow the skill at ${config.skillPath}.\n\nImplement all approved issues for this repository. The skill defines the full workflow — follow it exactly.`;
+    prompt = `Read and follow the skill at ${config.skillPath}.\n\nImplement all approved issues for this repository. The skill defines the full workflow — follow it exactly.\n\n${IMAGE_HANDLING_INSTRUCTIONS}`;
   } else if (config.prompt) {
+    // Custom user prompt — don't auto-modify (backward compat). Users who want
+    // image handling in a custom prompt should include their own instructions.
     prompt = config.prompt;
   } else {
     const issueScope = issueNumbers && issueNumbers.length > 0
@@ -176,6 +193,8 @@ export async function implementApprovedIssues(
 4. Push to ${config.featureBranch} and create a PR targeting ${config.baseBranch}.
 
 IMPORTANT: In PR descriptions, use "Related to #N" — NEVER use "Closes #N" or "Fixes #N". Issues are closed by the EM after production verification, not on dev merge.
+
+${IMAGE_HANDLING_INSTRUCTIONS}
 
 Work autonomously. Do not ask questions.`;
   }
@@ -329,7 +348,7 @@ export async function revisePRFeedback(
   let prompt: string;
 
   if (config.revisionSkillPath) {
-    prompt = `Read and follow the skill at ${config.revisionSkillPath}.\n\nRevise PR #${prNumber || "(pending)"} which has review feedback for this repository. The skill defines the full workflow — follow it exactly.${prContext}${labelNote}`;
+    prompt = `Read and follow the skill at ${config.revisionSkillPath}.\n\nRevise PR #${prNumber || "(pending)"} which has review feedback for this repository. The skill defines the full workflow — follow it exactly.${prContext}${labelNote}\n\n${IMAGE_HANDLING_INSTRUCTIONS}`;
   } else {
     prompt = `Revise PR #${prNumber || "(find open PRs with review feedback)"} in this repository.
 
@@ -340,6 +359,8 @@ export async function revisePRFeedback(
 5. Commit fixes with message: fix: address review feedback (#${prNumber || "<number>"})
 6. Push to the PR branch.
 ${prContext}${labelNote}
+
+${IMAGE_HANDLING_INSTRUCTIONS}
 
 Work autonomously. Do not ask questions.`;
   }

@@ -196,6 +196,14 @@ The Foreman delegates work by invoking Claude Code skills on each service repo. 
 
 The Foreman passes the issue context to Claude and instructs it to read and follow the skill. The skill defines the repo-specific implementation workflow — how to branch, test, and structure the PR.
 
+## Image handling in issue bodies
+
+Claude is multimodal — when an issue body or PR review comment contains markdown image references like `![alt](https://...)`, those images are part of the spec (mockups, screenshots, walkthrough frames). The Foreman appends instructions to its default and skill-driven prompts telling the agent to fetch each image to a temp file and `Read` it, so the model can see image content.
+
+For private-repo image URLs (e.g. `github.com/<owner>/<repo>/raw/<branch>/<path>`) the fetch uses `GH_TOKEN`-authed `curl`. For public CDN URLs (e.g. `github.com/user-attachments/...`) no auth is required.
+
+This is automatic for the built-in prompts (`skillPath` and the default implement/revise prompts). If you supply a fully custom `prompt` in config, include your own image-handling guidance — the Foreman does not modify custom prompts.
+
 ## Programmatic usage
 
 ```typescript
