@@ -2,15 +2,26 @@
 
 **The autonomous engineering delegator behind [slashbin.io](https://www.slashbin.io?utm_source=github&utm_medium=readme&utm_campaign=ai-foreman) — the webhook ETL gateway for engineers and AI agents. [Try slashbin.io free →](https://www.slashbin.io?utm_source=github&utm_medium=readme&utm_campaign=ai-foreman)**
 
-**Turn approved GitHub issues into shipped pull requests — autonomously.**
+**Turn approved GitHub issues into shipped pull requests — autonomously, across every repo you own.**
 
-*Picks up approved issues, invokes implementation skills on service repos, ships PRs, and responds to review feedback.*
+- **Cost:** $0 marginal under your Claude Max plan. Runs through the Claude Code CLI — no API charges, no SaaS subscription, no per-run fees.
+- **Safety:** Can't merge to `main` without approval. Every PR goes through branch protection; a reviewer — human, or an EM bot from [slashbin-ai-team](https://github.com/xrgarcia/slashbin-ai-team) — signs off before promotion.
+- **Scale:** One daemon manages many repos. Point it at your fleet, let it work overnight.
 
-The Foreman is an AI engineering agent that polls your repos for approved work, invokes a Claude Code skill (e.g. `/implement-approved-issues`) on each service repo, opens PRs, and revises based on reviewer feedback. Reviewers — human or AI — stay in the loop via PR reviews. Uses your CLI subscription — no per-run API costs.
+The Foreman is an AI engineering agent that polls your repos for approved work, invokes a Claude Code skill (e.g. `/implement-approved-issues`) on each service repo, opens PRs, and revises based on reviewer feedback. Reviewers — human or AI — stay in the loop via PR reviews.
 
 ## Who this is for
 
-- **Engineering teams** that want an AI teammate picking up approved issues overnight
+The Foreman shines when you have **more approved work than time to implement**. Three patterns:
+
+**1. Consulting / agency operators** — you maintain service repos for multiple clients. One daemon polls every client's repo with its own trigger label, base branch, and skill paths. Billable hours stay on strategy and review; implementation ships overnight.
+
+**2. Multi-business operators** — you run several companies, each with its own engineering backlog. Each business is an entry in the `repos` array; review flows, skills, and branch protection stay per-business.
+
+**3. Single business, many service repos** — microservices, internal tool sprawl, or a monolith plus satellites. The Foreman picks up an approved issue in whichever repo it's labeled on and ships a PR there.
+
+**Also useful for:**
+
 - **Solo developers** who want their backlog to shrink while they sleep
 - **Vibe coders** whose AI handles the planning — the Foreman handles the execution
 - **Teams running AI employees** via [slashbin-ai-team](https://github.com/xrgarcia/slashbin-ai-team) who need autonomous implementation behind the coordination layer
