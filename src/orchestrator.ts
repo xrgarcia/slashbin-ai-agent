@@ -186,6 +186,36 @@ async function tryBatchImplementation(
   // This prevents infinite loops where the Foreman re-implements the same
   // issues because the PR check in findActionableIssues didn't match.
   const repoState = loadRepoState(repoName);
+
+  // Self-heal the `implemented` cache (slashbin-ai-foreman #16/#18/#540 family).
+  //
+  // Invariant: `implemented[N]` must mean "a PR that delivers N exists".
+  // `findActionableIssues` already authoritatively returns only approved
+  // issues with NO linked PR (open or merged) — it is the same check the
+  // orchestrator trusts to decide what to implement. So any N that is BOTH
+  // still in `actionableIssues` (no delivering PR per the live check) AND in
+  // `repoState.implemented` is a stale, dead-zoned entry: a prior run recorded
+  // it without producing a delivering PR (PR creation failed, or its commit
+  // rode a foreign PR on the shared `features` branch). Left alone it is
+  // skipped forever with no recovery. The live no-linked-PR signal wins over
+  // the stale cache: prune so the issue is re-implemented this cycle.
+  //
+  // This cannot reintroduce the re-implement loop the cache guards against:
+  // that loop is "PR exists but the linkage check missed it" — here the same
+  // linkage check (findActionableIssues) reports NO PR, so there is nothing to
+  // loop on; true loops remain bounded by failureCount/cooldown + skip back-off.
+  // Additive only — no state shape / .ai-agent.json / branch-model change.
+  const staleImplemented = repoState.implemented.filter((n) => actionableIssues.includes(n));
+  if (staleImplemented.length > 0) {
+    repoLogger.warn(
+      `Self-heal: pruning ${staleImplemented.length} stale 'implemented' entr${staleImplemented.length === 1 ? "y" : "ies"} with no delivering PR — re-implementable: ${staleImplemented.map((n) => `#${n}`).join(", ")}`,
+    );
+    const healed = loadRepoState(repoName);
+    healed.implemented = healed.implemented.filter((n) => !staleImplemented.includes(n));
+    saveRepoState(repoName, healed);
+    repoState.implemented = healed.implemented;
+  }
+
   const alreadyImplemented = new Set(repoState.implemented);
   actionableIssues = actionableIssues.filter((n) => !alreadyImplemented.has(n));
   if (actionableIssues.length === 0) {
