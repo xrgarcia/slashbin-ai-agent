@@ -20,7 +20,7 @@ import {
   type PendingRevisionInfo,
 } from "./github.js";
 import { implementApprovedIssues, revisePRFeedback, type ImplementationResult, type RevisionResult } from "./agent.js";
-import { reconcileRepo } from "./reconciler.js";
+import { reconcileRepo, checkLocalBranchDivergence } from "./reconciler.js";
 import { verifyPRExists } from "./github.js";
 import { loadRepoState, saveRepoState } from "./state.js";
 
@@ -150,6 +150,42 @@ export async function runCycle(
   return { didWork: totalProcessed > 0, lastImplementation: lastResult, events };
 }
 
+/**
+ * Classify a recorded skip reason as transient + currently-resolved. Returns
+ * true only when (a) the reason matches a known transient pattern AND (b) the
+ * underlying precondition can be re-checked from this host AND (c) the check
+ * confirms the precondition no longer holds. Returning false is safe — the
+ * back-off continues normally.
+ *
+ * Known transient patterns:
+ * - "diverged from origin/<branch>" — local working clone ahead/behind origin;
+ *   resolved when both are 0. The skill emits this when `git pull origin
+ *   features` fails on a divergent branch state, typically caused by an EM
+ *   session leaving polluted refs in the shared clone (see
+ *   feedback_em_clone_stay_on_main). An EM manual reconcile
+ *   (`git branch -f features origin/features`) clears the cause but cannot
+ *   reach into the daemon's skip cache; this recheck lets the orchestrator
+ *   notice the cause is gone and admit on the next cycle instead of waiting
+ *   out the full 30-min back-off.
+ *
+ * Add new transient patterns here as they are identified. Durable reasons
+ * (issue-body says "investigation only", "no immediate code change") MUST
+ * stay caught by the default `return false` — those don't go away on retry.
+ */
+function isResolvedTransientSkip(
+  reason: string,
+  repoPath: string,
+  logger: Logger,
+): boolean {
+  const divergenceMatch = reason.match(/diverged from origin\/(\S+?)\b/i);
+  if (divergenceMatch) {
+    const branch = divergenceMatch[1];
+    const div = checkLocalBranchDivergence(repoPath, branch, logger);
+    return div !== null && div.ahead === 0 && div.behind === 0;
+  }
+  return false;
+}
+
 async function tryBatchImplementation(
   repoConfig: RepoConfig,
   logger: Logger,
@@ -229,20 +265,46 @@ async function tryBatchImplementation(
   // we don't burn an agent run every cycle correctly doing nothing.
   // Skipped entries are cleared automatically when the issue is re-implemented
   // (success path) or when the back-off expires.
+  //
+  // Reason-aware recheck: some skip reasons describe a TRANSIENT precondition
+  // (e.g., "local features branch diverged from origin/features") that an EM
+  // session can manually resolve mid-back-off. Before honoring the back-off,
+  // re-run the precondition check; if it now passes, admit the issue and clear
+  // the stale skip entry. This prevents the cache from pinning a dead-zone
+  // 30 minutes past an already-applied manual reconcile.
   const skippedMap = repoState.skipped ?? {};
   const SKIP_BACKOFF_MS = 30 * 60 * 1000; // 30 min
   const now = Date.now();
-  const stillBackedOff: number[] = [];
+  const stillBackedOff: { n: number; reason: string }[] = [];
+  const resolvedTransient: { n: number; reason: string }[] = [];
   actionableIssues = actionableIssues.filter((n) => {
     const entry = skippedMap[n];
     if (!entry) return true;
     const age = now - new Date(entry.lastSkippedAt).getTime();
     if (Number.isNaN(age) || age >= SKIP_BACKOFF_MS) return true;
-    stillBackedOff.push(n);
+    if (isResolvedTransientSkip(entry.reason, repoConfig.repoPath, repoLogger)) {
+      resolvedTransient.push({ n, reason: entry.reason });
+      return true;
+    }
+    stillBackedOff.push({ n, reason: entry.reason });
     return false;
   });
+  if (resolvedTransient.length > 0) {
+    repoLogger.info(
+      `Cleared ${resolvedTransient.length} resolved-transient skip entr${resolvedTransient.length === 1 ? "y" : "ies"}: ${resolvedTransient.map(({ n }) => `#${n}`).join(", ")}`,
+    );
+    const healed = loadRepoState(repoName);
+    healed.skipped = healed.skipped ?? {};
+    for (const { n } of resolvedTransient) delete healed.skipped[n];
+    saveRepoState(repoName, healed);
+    repoState.skipped = healed.skipped;
+  }
   if (stillBackedOff.length > 0) {
-    repoLogger.debug(`Backing off ${stillBackedOff.length} previously-skipped issue(s): ${stillBackedOff.map(n => `#${n}`).join(", ")}`);
+    // Promoted DEBUG → INFO so silent skip-cache filtering is visible in the
+    // journal (otherwise the pipeline appears stalled while the cache holds it).
+    repoLogger.info(
+      `Backing off ${stillBackedOff.length} previously-skipped issue(s): ${stillBackedOff.map(({ n, reason }) => `#${n} (${reason.split("\n")[0].slice(0, 100)})`).join("; ")}`,
+    );
   }
   if (actionableIssues.length === 0) {
     if (failures > 0) failureCount.set(repoName, 0);

@@ -25,6 +25,50 @@ function git(args: string[], cwd: string): string {
   }).trim();
 }
 
+export interface LocalBranchDivergence {
+  ahead: number;
+  behind: number;
+}
+
+/**
+ * Inspect divergence of a local branch ref vs `origin/<branch>` in a shared
+ * Foreman working clone. Fetches the branch first to ensure origin refs are
+ * current. Returns `null` if any git call fails (clone gone, network blip,
+ * branch missing) — callers must treat null as "unknown, don't act."
+ *
+ * Used by the orchestrator's skip-cache filter to re-check whether a
+ * previously-recorded "branch diverged" skip reason is still true. When EM
+ * manually reconciles a polluted local features ref (force-align to origin),
+ * the skip cache's 30-min back-off would otherwise pin the issue dead-zoned
+ * for that whole window before auto-clearing.
+ */
+export function checkLocalBranchDivergence(
+  repoPath: string,
+  branch: string,
+  logger: Logger,
+): LocalBranchDivergence | null {
+  try {
+    git(["fetch", "origin", branch, "--quiet"], repoPath);
+    const ahead = parseInt(
+      git(["rev-list", "--count", `origin/${branch}..${branch}`], repoPath),
+      10,
+    );
+    const behind = parseInt(
+      git(["rev-list", "--count", `${branch}..origin/${branch}`], repoPath),
+      10,
+    );
+    if (Number.isNaN(ahead) || Number.isNaN(behind)) return null;
+    return { ahead, behind };
+  } catch (err) {
+    logger.warn("Local branch divergence check failed", {
+      repoPath,
+      branch,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 /**
  * List remote branches matching the feature branch prefix.
  * Feature branches are named `features-*`, not a single `features` ref.
