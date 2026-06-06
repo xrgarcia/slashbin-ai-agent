@@ -129,6 +129,48 @@ export function findAllApprovedActionableIssues(
  */
 const MAX_BATCH_SIZE = 3;
 
+/**
+ * Extract the issue numbers a PR actually IMPLEMENTS (closes/relates), as
+ * opposed to merely mentions in prose. An issue counts as implemented when:
+ *   - it appears after a closing/relating keyword (Closes/Fixes/Resolves/
+ *     Related to/Refs/See #N) anywhere in title, body, or commit messages, OR
+ *   - it appears as a `(#N)` suffix in the PR TITLE or a commit HEADLINE
+ *     (the canonical `feat: foo (#N)` form).
+ *
+ * A bare `#N`, or a `(#N)` mention in the free-text BODY (e.g.
+ * "tracked separately in #3", "the forthcoming handler (#2)"), does NOT
+ * count — those are forward references to sibling issues, not implementations.
+ * Counting them orphaned cmneb_public_api #2/#3 (slashbin-ai-foreman#28):
+ * a schema PR's body mentioning the not-yet-built endpoint issue marked that
+ * issue "implemented"/"covered", so it was never picked up.
+ */
+export function extractImplementedIssues(opts: {
+  title?: string;
+  body?: string;
+  commitHeadlines?: string[];
+  commitBodies?: string[];
+}): number[] {
+  const { title = "", body = "", commitHeadlines = [], commitBodies = [] } = opts;
+  const keywordRe = /\b(?:related\s+to|closes?|fixes?|resolves?|refs?|see)\s*:?\s*#(\d+)/gi;
+  const suffixRe = /\(#(\d+)\)/g;
+  const found = new Set<number>();
+
+  // Keyword references are explicit intent — authoritative anywhere.
+  const keywordText = [title, body, ...commitHeadlines, ...commitBodies].join("\n");
+  for (const m of keywordText.matchAll(keywordRe)) {
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n)) found.add(n);
+  }
+  // `(#N)` suffix is authoritative ONLY in the title or a commit headline —
+  // never the free-text body, where it is a prose mention of a sibling issue.
+  const suffixText = [title, ...commitHeadlines].join("\n");
+  for (const m of suffixText.matchAll(suffixRe)) {
+    const n = parseInt(m[1], 10);
+    if (Number.isFinite(n)) found.add(n);
+  }
+  return Array.from(found).sort((a, b) => a - b);
+}
+
 export function findActionableIssues(
   config: RepoConfig,
   logger: Logger
@@ -191,13 +233,22 @@ export function findActionableIssues(
     const openPrs: { number: number; title: string; body: string }[] = JSON.parse(openPrJson || "[]");
     const mergedPrs: { number: number; title: string; body: string }[] = JSON.parse(mergedPrJson || "[]");
     const allPrs = [...openPrs, ...mergedPrs];
-    const prText = allPrs.map((pr) => `${pr.title} ${pr.body}`).join(" ");
+
+    // An issue is "covered" only if some PR IMPLEMENTS it (close/relate keyword,
+    // or `(#N)` in the title) — NOT merely mentions it in body prose. The old
+    // bare-`#N` test over concatenated title+body orphaned issues that a sibling
+    // PR's body referenced (e.g. a schema PR body saying "tracked separately in
+    // #3" made #3 look covered, so it was never implemented). (slashbin-ai-foreman#28)
+    const covered = new Set<number>();
+    for (const pr of allPrs) {
+      for (const n of extractImplementedIssues({ title: pr.title, body: pr.body })) {
+        covered.add(n);
+      }
+    }
 
     const uncovered: number[] = [];
     for (const issueNum of actionable) {
-      // Use word boundary to avoid #1 matching #10, #100, etc.
-      const pattern = new RegExp(`#${issueNum}(?!\\d)`);
-      if (!pattern.test(prText)) {
+      if (!covered.has(issueNum)) {
         uncovered.push(issueNum);
       }
     }
@@ -820,31 +871,18 @@ export function getReferencedIssuesFromOpenPR(
     if (prs.length === 0) return null;
     const pr = prs[0];
 
-    // Aggregate every text source the implementation skill might have used to
-    // reference the issue: PR title (`feat: foo (#N)`), PR body (`Related to #N`,
-    // `Closes #N`, etc.), and each commit message in the PR.
-    const sources: string[] = [pr.title || "", pr.body || ""];
-    for (const c of pr.commits || []) {
-      sources.push(c.messageHeadline || "");
-      sources.push(c.messageBody || "");
-    }
-    const text = sources.join("\n");
-
-    // Match keywords + optional `to`/`:` + `#<number>`. Case-insensitive.
-    // Also catches the trailing `(#N)` style commonly written by the canonical
-    // implement-approved-issues skill in PR titles.
-    const found = new Set<number>();
-    const keywordRe = /\b(?:related\s+to|closes?|fixes?|resolves?|refs?|see)\s*:?\s*#(\d+)/gi;
-    const titleSuffixRe = /\(#(\d+)\)/g;
-    for (const m of text.matchAll(keywordRe)) {
-      const n = parseInt(m[1], 10);
-      if (Number.isFinite(n)) found.add(n);
-    }
-    for (const m of text.matchAll(titleSuffixRe)) {
-      const n = parseInt(m[1], 10);
-      if (Number.isFinite(n)) found.add(n);
-    }
-    return Array.from(found).sort((a, b) => a - b);
+    // Count an issue as referenced only if the PR IMPLEMENTS it (close/relate
+    // keyword anywhere, or `(#N)` in the title / a commit headline) — never a
+    // bare `(#N)` mention in the free-text body. A schema PR whose body said
+    // "the forthcoming handler (#2) will..." otherwise falsely marked #2
+    // implemented, orphaning it. (slashbin-ai-foreman#28)
+    const commits = (pr.commits || []) as { messageHeadline?: string; messageBody?: string }[];
+    return extractImplementedIssues({
+      title: pr.title || "",
+      body: pr.body || "",
+      commitHeadlines: commits.map((c) => c.messageHeadline || ""),
+      commitBodies: commits.map((c) => c.messageBody || ""),
+    });
   } catch (err) {
     logger?.warn("getReferencedIssuesFromOpenPR: gh pr list failed", { ...formatGhError(err), repo, headBranch, baseBranch });
     return null;
