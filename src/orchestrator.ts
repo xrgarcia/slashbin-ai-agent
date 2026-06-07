@@ -605,9 +605,14 @@ async function tryReview(
     if (result.success) {
       reviewFailureCount.set(repoName, 0);
       reviewFailureHitMaxAt.delete(repoName);
-      const summaryLine = (result.summary || "review completed").split("\n")[0].slice(0, 240);
       reviewLogger.info(`Review run completed for ${repoName}`);
-      events?.push({ message: `Reviewed ${repoConfig.githubRepo} PR #${candidate.prNumber} — ${summaryLine}`, level: "info" });
+      // Prefer the structured per-PR status (includes deploy SUCCESS/FAILURE);
+      // fall back to the summary's first line when no trailer was emitted.
+      const outcome = result.statusLine
+        ? result.statusLine
+        : (result.summary || "review completed").split("\n")[0].slice(0, 240);
+      const prefix = result.statusLine ? "" : `PR #${candidate.prNumber} — `;
+      events?.push({ message: `Reviewed ${repoConfig.githubRepo} — ${prefix}${outcome}`, level: "info" });
       return true;
     }
 

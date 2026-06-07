@@ -15,6 +15,29 @@ export interface ReviewResult {
   error?: string;
   // The skill's final summary text (parsed from the stream-json result event).
   summary?: string;
+  // Concise per-PR status parsed from the FOREMAN_REVIEW trailer(s), including the
+  // deployment outcome — e.g. "#100 APPROVE · merged · deploy SUCCESS". Surfaced
+  // in the Foreman's Discord status line. Undefined if no trailer was emitted.
+  statusLine?: string;
+}
+
+/**
+ * Parse the structured review trailers the skill is asked to emit, one per PR it
+ * acted on:
+ *   FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS
+ * Returns a concise human-readable line, or undefined when no trailer is present.
+ */
+function parseReviewTrailers(stdout: string): string | undefined {
+  const re = /FOREMAN_REVIEW\s+pr=#?(\d+)\s+verdict=(\S+)\s+merged=(\S+)\s+deploy=(\S+)/gi;
+  const parts: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stdout)) !== null) {
+    const [, pr, verdict, merged, deploy] = m;
+    const mergedTxt = /^y(es)?|true$/i.test(merged) ? "merged" : "not merged";
+    const deployTxt = /^(na|n\/a|none)$/i.test(deploy) ? "no deploy" : `deploy ${deploy.toUpperCase()}`;
+    parts.push(`#${pr} ${verdict.toUpperCase()} · ${mergedTxt} · ${deployTxt}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : undefined;
 }
 
 export interface ImplementationResult {
@@ -573,6 +596,12 @@ Follow the skill exactly and act autonomously — do NOT ask questions or wait f
 
 If there are no open feature PRs awaiting review for this repo, that is a clean no-op — say so and stop.
 
+IMPORTANT — status trailer: After you finish, end your output with one line per PR you acted on, in EXACTLY this format (nothing after the last one):
+
+FOREMAN_REVIEW pr=#<number> verdict=<APPROVE|REQUEST_CHANGES> merged=<yes|no> deploy=<SUCCESS|FAILURE|NA>
+
+Rules for the trailer: \`merged=yes\` only if you actually merged the PR to the base branch. \`deploy=SUCCESS\`/\`deploy=FAILURE\` reflects the post-merge deployment+verification result for that merge (use \`deploy=NA\` when nothing was merged, or when the repo has no deployment to verify, e.g. a docs/CLI/npm-package repo). Emit one trailer line for every PR you reviewed this run.
+
 ${IMAGE_HANDLING_INSTRUCTIONS}`;
 
   const result = await spawnClaudeWithOptions(
@@ -604,10 +633,14 @@ ${IMAGE_HANDLING_INSTRUCTIONS}`;
   }
 
   const summary = extractStreamResult(result.stdout);
+  const statusLine = parseReviewTrailers(result.stdout);
   if (summary) {
     logger.info(`Review completed for ${repoConfig.name}:\n${summary}`);
   } else {
     logger.info(`Review completed for ${repoConfig.name} (no parseable summary; see transcript${transcriptPath ? ` ${transcriptPath}` : ""})`);
   }
-  return { success: true, summary };
+  if (statusLine) {
+    logger.info(`Review outcome for ${repoConfig.name}: ${statusLine}`);
+  }
+  return { success: true, summary, statusLine };
 }
