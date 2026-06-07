@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import {
@@ -5,6 +6,7 @@ import {
   findAllApprovedActionableIssues,
   hasPendingRevisions,
   findPendingRevisions,
+  findPRsNeedingReview,
   transitionRevisionLabels,
   transitionImplementationLabels,
   getReferencedIssuesFromOpenPR,
@@ -19,7 +21,7 @@ import {
   stripReadyForProdLabel,
   type PendingRevisionInfo,
 } from "./github.js";
-import { implementApprovedIssues, revisePRFeedback, type ImplementationResult, type RevisionResult } from "./agent.js";
+import { implementApprovedIssues, revisePRFeedback, reviewOpenPRs, type ImplementationResult, type RevisionResult } from "./agent.js";
 import { reconcileRepo, checkLocalBranchDivergence } from "./reconciler.js";
 import { verifyPRExists } from "./github.js";
 import { loadRepoState, saveRepoState } from "./state.js";
@@ -33,6 +35,8 @@ let abortController: AbortController | null = null;
 const failureCount = new Map<string, number>();
 const failureHitMaxAt = new Map<string, number>(); // cycle when max was hit
 const revisionFailureCount = new Map<string, number>();
+const reviewFailureCount = new Map<string, number>();
+const reviewFailureHitMaxAt = new Map<string, number>();
 
 const FAILURE_COOLDOWN_CYCLES = 3; // retry after this many idle cycles
 const lastFailureReason = new Map<string, string>(); // per-repo last failure for retry context
@@ -99,7 +103,21 @@ export async function runCycle(
     }
   }
 
-  // --- Phase 1: Revise PRs with pending review feedback ---
+  // --- Phase 1: Review open feature PRs (invokes the EM /review-all-prs skill) ---
+  // Runs FIRST among the PR-acting phases so it only acts on PRs labeled
+  // `pr under review` in a PRIOR cycle (labels settled). PRs created by THIS
+  // cycle's implement phase wait for next cycle's review — avoids a same-cycle
+  // GitHub-consistency race. The skill owns its own label transitions and merges;
+  // its side effects (`ready for prod release` / `pr pending actions`) feed the
+  // promote and revise phases respectively.
+  for (const repoConfig of config.repos) {
+    const reviewed = await tryReview(repoConfig, config, logger, cycleNumber, events);
+    if (reviewed) {
+      totalProcessed++;
+    }
+  }
+
+  // --- Phase 2: Revise PRs with pending review feedback ---
   for (const repoConfig of config.repos) {
     const revisionInfo = await tryRevision(repoConfig, logger, cycleNumber);
     if (revisionInfo) {
@@ -108,7 +126,7 @@ export async function runCycle(
     }
   }
 
-  // --- Phase 2: Implement approved issues (one batch per repo) ---
+  // --- Phase 3: Implement approved issues (one batch per repo) ---
   for (const repoConfig of config.repos) {
     const result = await tryBatchImplementation(repoConfig, logger, cycleNumber, events);
     if (result) {
@@ -117,7 +135,7 @@ export async function runCycle(
     }
   }
 
-  // --- Phase 3: Reconcile branch drift (main → develop) for any repo with
+  // --- Phase 4: Reconcile branch drift (main → develop) for any repo with
   //    post-promotion merge commits. Runs independently of promotion work so
   //    drift is cleared even when no ready-for-prod issues exist. ---
   for (const repoConfig of config.repos) {
@@ -129,7 +147,7 @@ export async function runCycle(
     }
   }
 
-  // --- Phase 4: Create promotion PRs for repos with ready-for-prod issues ---
+  // --- Phase 5: Create promotion PRs for repos with ready-for-prod issues ---
   for (const repoConfig of config.repos) {
     const promotionResult = tryPromotion(repoConfig, logger, cycleNumber);
     if (promotionResult === "promoted") {
@@ -523,6 +541,82 @@ async function tryRevision(
     }
 
     return null;
+  } finally {
+    implementing = null;
+    abortController = null;
+  }
+}
+
+/**
+ * Review phase: invoke the EM /review-all-prs skill, scoped to one repo, when it
+ * has an open feature PR awaiting review (`pr under review`, no current EM review).
+ *
+ * Unlike implement/revise, the orchestrator does NOT transition labels afterward —
+ * the skill owns its own merges and label transitions at full fidelity. We just
+ * gate, trigger, log, and back off on failure. Every run's full interaction is
+ * written to logs/review/<repo>-cycle<N>-<ts>.log for debugging.
+ *
+ * Returns true when a review run was triggered (regardless of verdict).
+ */
+async function tryReview(
+  repoConfig: RepoConfig,
+  config: AgentConfig,
+  logger: Logger,
+  cycleNumber: number,
+  events?: CycleEvent[],
+): Promise<boolean> {
+  if (!repoConfig.reviewEnabled) return false;
+
+  const repoName = repoConfig.name;
+  const reviewLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "review" });
+
+  // Failure back-off with cooldown (mirrors the implement phase).
+  const failures = reviewFailureCount.get(repoName) ?? 0;
+  if (failures >= MAX_RETRIES) {
+    const hitAt = reviewFailureHitMaxAt.get(repoName) ?? cycleNumber;
+    const cyclesSinceMax = cycleNumber - hitAt;
+    if (cyclesSinceMax < FAILURE_COOLDOWN_CYCLES) {
+      reviewLogger.debug(`Skipping ${repoName} review — ${failures} consecutive failures, cooldown ${cyclesSinceMax}/${FAILURE_COOLDOWN_CYCLES}`);
+      return false;
+    }
+    reviewLogger.info(`Review failure cooldown expired for ${repoName} — resetting and retrying`);
+    reviewFailureCount.set(repoName, 0);
+    reviewFailureHitMaxAt.delete(repoName);
+  }
+
+  // Gate: is there an open feature PR awaiting EM review?
+  const candidate = findPRsNeedingReview(repoConfig, config.reviewerLogin, reviewLogger);
+  if (!candidate) {
+    if (failures > 0) reviewFailureCount.set(repoName, 0);
+    return false;
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const transcriptPath = resolve(process.cwd(), "logs", "review", `${repoName}-cycle${cycleNumber}-${ts}.log`);
+
+  implementing = repoName;
+  abortController = new AbortController();
+  reviewLogger.info(`Triggering review for ${repoName} — PR #${candidate.prNumber} (issues: ${candidate.issueNumbers.map(n => `#${n}`).join(", ")}), transcript: ${transcriptPath}`);
+  events?.push({ message: `Reviewing ${repoConfig.githubRepo} PR #${candidate.prNumber} (issues: ${candidate.issueNumbers.map(n => `#${n}`).join(", ")})`, level: "info" });
+
+  try {
+    const result = await reviewOpenPRs(repoConfig, config, reviewLogger, abortController.signal, transcriptPath);
+
+    if (result.success) {
+      reviewFailureCount.set(repoName, 0);
+      reviewFailureHitMaxAt.delete(repoName);
+      const summaryLine = (result.summary || "review completed").split("\n")[0].slice(0, 240);
+      reviewLogger.info(`Review run completed for ${repoName}`);
+      events?.push({ message: `Reviewed ${repoConfig.githubRepo} PR #${candidate.prNumber} — ${summaryLine}`, level: "info" });
+      return true;
+    }
+
+    const newCount = failures + 1;
+    reviewFailureCount.set(repoName, newCount);
+    if (newCount >= MAX_RETRIES) reviewFailureHitMaxAt.set(repoName, cycleNumber);
+    reviewLogger.warn(`Review failed (${newCount}/${MAX_RETRIES}): ${result.error}`);
+    events?.push({ message: `Review failed on ${repoConfig.githubRepo} PR #${candidate.prNumber}: ${result.error}`, level: "error" });
+    return false;
   } finally {
     implementing = null;
     abortController = null;

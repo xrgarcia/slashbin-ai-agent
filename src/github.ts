@@ -364,6 +364,124 @@ export function hasPendingRevisions(
   return findPendingRevisions(config, logger) !== null;
 }
 
+export interface ReviewCandidate {
+  prNumber: number;
+  prUrl: string;
+  issueNumbers: number[];
+}
+
+/**
+ * Gate check for the review phase: is there an open feature PR whose linked
+ * issue(s) are labeled `pr under review` (set by implement/revise) and that has
+ * NOT already been reviewed by the EM at its current head?
+ *
+ * Idempotency is primarily label-driven and self-cleaning: a full-fidelity review
+ * run either merges an approved PR (closes it → out of scope here) or posts
+ * REQUEST_CHANGES and relabels the issue `pr pending actions` (→ owned by the
+ * revise phase, excluded below). The freshness guard (`hasFreshReview`) covers the
+ * remaining window where a review run crashed after posting its verdict but before
+ * relabeling — without it the same PR would be re-reviewed every cycle.
+ *
+ * Returns null when there's nothing to review.
+ */
+export function findPRsNeedingReview(
+  config: RepoConfig,
+  reviewerLogin: string,
+  logger: Logger,
+): ReviewCandidate | null {
+  try {
+    const issueJson = gh([
+      "issue", "list",
+      "--repo", config.githubRepo,
+      "--state", "open",
+      "--label", "pr under review",
+      "--json", "number,labels",
+      "--limit", "100",
+    ], config.repoPath);
+
+    const issues: { number: number; labels: { name: string }[] }[] = JSON.parse(issueJson || "[]");
+    // Exclude issues also labeled `pr pending actions` — the revise phase owns those.
+    const reviewable = issues.filter((i) => !i.labels.some((l) => l.name === "pr pending actions"));
+    if (reviewable.length === 0) return null;
+
+    // Confirm an open feature PR exists (features → develop).
+    const prJson = gh([
+      "pr", "list",
+      "--repo", config.githubRepo,
+      "--state", "open",
+      "--head", config.featureBranch,
+      "--base", config.baseBranch,
+      "--json", "number,url",
+      "--limit", "1",
+    ], config.repoPath);
+
+    const prs: { number: number; url: string }[] = JSON.parse(prJson || "[]");
+    if (prs.length === 0) {
+      logger.debug(`${config.name}: ${reviewable.length} issue(s) labeled "pr under review" but no open feature PR`);
+      return null;
+    }
+    const pr = prs[0];
+
+    if (hasFreshReview(config, pr.number, reviewerLogin, logger)) {
+      logger.debug(`${config.name}: PR #${pr.number} already has a current ${reviewerLogin} review — skipping re-review`);
+      return null;
+    }
+
+    logger.info(
+      `${config.name}: PR #${pr.number} needs review (issues: ${reviewable.map((i) => `#${i.number}`).join(", ")})`,
+    );
+    return { prNumber: pr.number, prUrl: pr.url, issueNumbers: reviewable.map((i) => i.number) };
+  } catch (err) {
+    logger.error("Failed to check for PRs needing review", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * True when the PR already has an APPROVED/CHANGES_REQUESTED review by
+ * `reviewerLogin` submitted at or after the PR's latest commit (i.e. the current
+ * head has already been reviewed). On any lookup failure returns false — we'd
+ * rather (rarely) re-review than silently never review.
+ */
+function hasFreshReview(
+  config: RepoConfig,
+  prNumber: number,
+  reviewerLogin: string,
+  logger: Logger,
+): boolean {
+  try {
+    const json = gh([
+      "pr", "view", String(prNumber),
+      "--repo", config.githubRepo,
+      "--json", "reviews,commits",
+    ], config.repoPath);
+    const data = JSON.parse(json || "{}") as {
+      commits?: { committedDate?: string }[];
+      reviews?: { author?: { login?: string }; state?: string; submittedAt?: string }[];
+    };
+    const commits = data.commits ?? [];
+    const reviews = data.reviews ?? [];
+    if (commits.length === 0) return false;
+
+    const lastCommitMs = commits
+      .map((c) => (c.committedDate ? new Date(c.committedDate).getTime() : 0))
+      .reduce((a, b) => Math.max(a, b), 0);
+
+    return reviews.some(
+      (r) =>
+        r.author?.login === reviewerLogin &&
+        (r.state === "APPROVED" || r.state === "CHANGES_REQUESTED") &&
+        !!r.submittedAt &&
+        new Date(r.submittedAt).getTime() >= lastCommitMs,
+    );
+  } catch (err) {
+    logger.debug(`hasFreshReview lookup failed for PR #${prNumber}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
 /**
  * Transition issue labels after successful revision:
  * remove "pr pending actions", add "pr under review".

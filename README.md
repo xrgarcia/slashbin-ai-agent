@@ -28,17 +28,18 @@ The Foreman shines when you have **more approved work than time to implement**. 
 
 ## What the Foreman does
 
-Each poll cycle runs five phases across every configured repo:
+Each poll cycle runs six phases across every configured repo:
 
 ```
-Reconciliation → Revision → Implementation → Branch Sync → Promotion
+Reconciliation → Review → Revision → Implementation → Branch Sync → Promotion
 ```
 
 1. **Reconcile** — detects orphaned commits on the features branch with no PR and creates one
-2. **Revise** — finds PRs with pending review feedback and revises them (prioritized over new work)
-3. **Implement** — picks up approved issues and invokes the repo's implementation skill via Claude Code (up to 3 issues per cycle; 1 in greenfield repos)
-4. **Branch Sync** — merges main → develop to keep branches aligned after promotions
-5. **Promote** — creates promotion PRs (develop → main) for issues labeled `ready for prod release`
+2. **Review** *(opt-in)* — when `reviewEnabled` is set, invokes a review skill on open feature PRs awaiting review. The review skill runs in a **separate review repo** (`emRepoPath`) under a separate GitHub token, and owns its own merge + label decisions; its label side effects (approve → ready-for-prod; request-changes → pending-actions) feed the Promote and Revise phases. Disabled by default — see [Review phase](#review-phase-opt-in)
+3. **Revise** — finds PRs with pending review feedback and revises them (prioritized over new work)
+4. **Implement** — picks up approved issues and invokes the repo's implementation skill via Claude Code (up to 3 issues per cycle; 1 in greenfield repos)
+5. **Branch Sync** — merges main → develop to keep branches aligned after promotions
+6. **Promote** — creates promotion PRs (develop → main) for issues labeled `ready for prod release`
 
 - **Poll interval is configurable** — default 5 minutes (`pollIntervalMs` in config)
 - **Multi-repo** — manages multiple repos in a single daemon, each with its own skill paths and config
@@ -207,6 +208,50 @@ The Foreman delegates work by invoking Claude Code skills on each service repo. 
 
 The Foreman passes the issue context to Claude and instructs it to read and follow the skill. The skill defines the repo-specific implementation workflow — how to branch, test, and structure the PR.
 
+## Review phase (opt-in)
+
+The Review phase closes the loop between Implementation and Revision by invoking a
+**review skill** on open feature PRs awaiting review — automating the human/agent
+reviewer step. It is **disabled by default** (`reviewEnabled: false`); a vanilla
+config keeps the original five-phase behavior unchanged.
+
+It differs from Implementation/Revision in three ways, because review is a
+decision-layer workflow rather than an in-repo edit:
+
+- **Runs in a separate review repo.** The review skill is invoked with its working
+  directory set to `emRepoPath`, not the service repo — so it has the reviewer's own
+  tooling (MCP servers, verification scripts, context docs) available.
+- **Runs under a separate token.** Reviews and merges are attributed to the account
+  behind `EM_GITHUB_TOKEN` (distinct from `FOREMAN_GITHUB_TOKEN`), keeping the
+  reviewer identity separate from the implementer identity.
+- **Owns its own outcomes.** The skill posts the verdict, merges approved PRs, and
+  transitions issue labels itself — the Foreman does not relabel afterward. The label
+  side effects feed the other phases: approve → `ready for prod release` (Promote);
+  request-changes → `pr pending actions` (Revise).
+
+Every review run's full turn-by-turn interaction (`--output-format stream-json`) is
+written verbatim to `logs/review/<repo>-cycle<N>-<timestamp>.log` for debugging.
+
+A PR is gated into review only when its linked issue is labeled `pr under review`,
+it has an open `featureBranch → baseBranch` PR, and there is no review by
+`reviewerLogin` newer than the PR's latest commit (a freshness guard against
+re-review loops).
+
+Review config keys (all optional; global, with a per-repo `reviewEnabled` override):
+
+| Key | Default | Description |
+|---|---|---|
+| `reviewEnabled` | `false` | Enable the Review phase (per-repo override supported) |
+| `emRepoPath` | — | Working dir for the review skill (the review repo). Required when enabled |
+| `reviewSkillPath` | `.claude/skills/review-all-prs/SKILL.md` | Review skill, relative to `emRepoPath` |
+| `reviewModel` | — | Model override for review runs |
+| `reviewMaxTurns` | `200` | Max turns (review + verify is long-running) |
+| `reviewMaxDurationMs` | `3600000` (60 min) | Max review duration |
+| `reviewAllowedTools` | broad MCP + shell set | Tool surface for the review skill |
+| `reviewerLogin` | `slashbin-engineering-manager` | GitHub login the review runs as (freshness guard) |
+
+Requires `EM_GITHUB_TOKEN` in the environment when enabled.
+
 ## Image handling in issue bodies
 
 Claude is multimodal — when an issue body or PR review comment contains markdown image references like `![alt](https://...)`, those images are part of the spec (mockups, screenshots, walkthrough frames). The Foreman appends instructions to its default and skill-driven prompts telling the agent to fetch each image to a temp file and `Read` it, so the model can see image content.
@@ -238,7 +283,7 @@ src/
 ├── github.ts          # GitHub API (polling, PRs, labels, dual-token ops)
 ├── agent.ts           # Claude Code CLI spawner
 ├── reviewer.ts        # PR review feedback handler
-├── orchestrator.ts    # 5-phase cycle, failure cooldowns, state tracking
+├── orchestrator.ts    # 6-phase cycle, failure cooldowns, state tracking
 ├── state.ts           # Persistent state management
 ├── daemon.ts          # Poll loop, graceful shutdown, Discord bridge
 ├── bridge-client.ts   # WebSocket client for Discord notifications

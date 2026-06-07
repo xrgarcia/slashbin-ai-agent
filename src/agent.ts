@@ -1,11 +1,20 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import type { RepoConfig } from "./config.js";
+import { mkdirSync, createWriteStream, type WriteStream } from "node:fs";
+import { dirname } from "node:path";
+import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { verifyPRExists, checkPRHasChanges, getRemoteBranchSha } from "./github.js";
 
 export interface RevisionResult {
   success: boolean;
   error?: string;
+}
+
+export interface ReviewResult {
+  success: boolean;
+  error?: string;
+  // The skill's final summary text (parsed from the stream-json result event).
+  summary?: string;
 }
 
 export interface ImplementationResult {
@@ -81,26 +90,80 @@ const IMAGE_HANDLING_INSTRUCTIONS = `IMAGE HANDLING: If an issue body or PR revi
 
 The Authorization header is required for private-repo URLs (github.com/.../raw/...) and harmless for public CDN URLs (github.com/user-attachments/...). If a fetch fails, log a warning and proceed with the text spec — do not abort the implementation.`;
 
-function spawnClaude(
+interface SpawnOptions {
+  /** Working directory for the claude process. */
+  cwd: string;
+  /** Value to inject as GH_TOKEN (controls GitHub account attribution). */
+  ghToken?: string;
+  model?: string;
+  allowedTools: string[];
+  maxTurns: number;
+  maxDurationMs: number;
+  /**
+   * Emit the full turn-by-turn interaction as newline-delimited JSON
+   * (`--output-format stream-json --verbose`) instead of just the final text.
+   * Used by the review phase so the transcript captures every tool call + result.
+   */
+  streamJson?: boolean;
+  /**
+   * When set, the raw stdout/stderr stream is appended to this file verbatim for
+   * post-hoc debugging. The directory is created if needed.
+   */
+  transcriptPath?: string;
+}
+
+/**
+ * Low-level Claude CLI spawn. All callers go through this so the timeout/abort/
+ * stream-capture behavior is shared. The per-call options carry cwd, token, and
+ * tool surface — implement/revise run in the service repo under the Foreman
+ * token; review runs in the EM repo under the EM token (see reviewOpenPRs).
+ */
+function spawnClaudeWithOptions(
   prompt: string,
-  config: RepoConfig,
+  opts: SpawnOptions,
   logger: Logger,
   abortSignal?: AbortSignal
 ): Promise<SpawnResult> {
   const args = [
     "--print",
     prompt,
-    "--max-turns", String(config.maxTurns),
+    "--max-turns", String(opts.maxTurns),
     "--dangerously-skip-permissions",
   ];
 
-  if (config.model) {
-    args.push("--model", config.model);
+  if (opts.streamJson) {
+    args.push("--output-format", "stream-json", "--verbose");
   }
 
-  if (config.allowedTools.length > 0) {
-    args.push("--allowedTools", config.allowedTools.join(","));
+  if (opts.model) {
+    args.push("--model", opts.model);
   }
+
+  if (opts.allowedTools.length > 0) {
+    args.push("--allowedTools", opts.allowedTools.join(","));
+  }
+
+  let transcript: WriteStream | null = null;
+  if (opts.transcriptPath) {
+    try {
+      mkdirSync(dirname(opts.transcriptPath), { recursive: true });
+      transcript = createWriteStream(opts.transcriptPath, { flags: "a" });
+      const argsForLog = args.map((a) => (a === prompt ? "<prompt>" : a));
+      transcript.write(
+        `# claude invocation @ ${new Date().toISOString()}\n` +
+        `# cwd=${opts.cwd}\n` +
+        `# args=${JSON.stringify(argsForLog)}\n` +
+        `# prompt:\n${prompt}\n\n===== STREAM =====\n`
+      );
+    } catch (err) {
+      logger.warn(`Failed to open transcript ${opts.transcriptPath}: ${err instanceof Error ? err.message : String(err)}`);
+      transcript = null;
+    }
+  }
+
+  // GH_TOKEN must be a string or absent — never literal "undefined".
+  const env: Record<string, string> = { ...process.env } as Record<string, string>;
+  if (opts.ghToken) env.GH_TOKEN = opts.ghToken;
 
   return new Promise<SpawnResult>((resolve) => {
     let stdout = "";
@@ -108,16 +171,25 @@ function spawnClaude(
     let child: ChildProcess | null = null;
     let timedOut = false;
 
+    const finish = (r: SpawnResult) => {
+      if (transcript) {
+        transcript.write(`\n===== END (exit=${r.exitCode}${r.timedOut ? ", timedOut" : ""}) @ ${new Date().toISOString()} =====\n`);
+        transcript.end();
+        transcript = null;
+      }
+      resolve(r);
+    };
+
     const timeout = setTimeout(() => {
       timedOut = true;
-      logger.warn(`Claude CLI timed out after ${config.maxDurationMs}ms`);
+      logger.warn(`Claude CLI timed out after ${opts.maxDurationMs}ms`);
       if (child) {
         child.kill("SIGTERM");
         setTimeout(() => {
           if (child && !child.killed) child.kill("SIGKILL");
         }, 10_000);
       }
-    }, config.maxDurationMs);
+    }, opts.maxDurationMs);
 
     const onAbort = () => {
       logger.warn("Claude CLI aborted");
@@ -128,18 +200,21 @@ function spawnClaude(
     }
 
     child = spawn("claude", args, {
-      cwd: config.repoPath,
-      env: { ...process.env, GH_TOKEN: process.env.FOREMAN_GITHUB_TOKEN } as Record<string, string>,
+      cwd: opts.cwd,
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
     child.stdout?.on("data", (data: Buffer) => {
       stdout += data.toString();
+      transcript?.write(data);
     });
 
     child.stderr?.on("data", (data: Buffer) => {
-      stderr += data.toString();
-      const lines = data.toString().split("\n").filter(Boolean);
+      const text = data.toString();
+      stderr += text;
+      transcript?.write(`[stderr] ${text}`);
+      const lines = text.split("\n").filter(Boolean);
       for (const line of lines) {
         logger.warn(`[claude stderr] ${line}`);
       }
@@ -148,16 +223,61 @@ function spawnClaude(
     child.on("error", (err) => {
       clearTimeout(timeout);
       if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr: err.message, exitCode: -1, timedOut: false });
+      finish({ stdout, stderr: err.message, exitCode: -1, timedOut: false });
     });
 
     child.on("close", (code) => {
       clearTimeout(timeout);
       if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
       child = null;
-      resolve({ stdout, stderr, exitCode: code, timedOut });
+      finish({ stdout, stderr, exitCode: code, timedOut });
     });
   });
+}
+
+/**
+ * Backward-compatible spawn for implement/revise: runs in the service repo under
+ * the Foreman token with the narrow tool set, final-text output, no transcript.
+ */
+function spawnClaude(
+  prompt: string,
+  config: RepoConfig,
+  logger: Logger,
+  abortSignal?: AbortSignal
+): Promise<SpawnResult> {
+  return spawnClaudeWithOptions(
+    prompt,
+    {
+      cwd: config.repoPath,
+      ghToken: process.env.FOREMAN_GITHUB_TOKEN,
+      model: config.model,
+      allowedTools: config.allowedTools,
+      maxTurns: config.maxTurns,
+      maxDurationMs: config.maxDurationMs,
+    },
+    logger,
+    abortSignal
+  );
+}
+
+/**
+ * Parse the final `result` event from a stream-json transcript and return its
+ * text (truncated). Falls back to undefined when no result event is present.
+ */
+function extractStreamResult(stdout: string): string | undefined {
+  const lines = stdout.split("\n").filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const evt = JSON.parse(lines[i]);
+      if (evt && evt.type === "result") {
+        const text = typeof evt.result === "string" ? evt.result : JSON.stringify(evt);
+        return text.slice(0, 2000);
+      }
+    } catch {
+      // not a JSON line — keep scanning
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -400,4 +520,94 @@ Work autonomously. Do not ask questions.`;
 
   logger.info(`PR revision completed successfully for ${config.name}`);
   return { success: true };
+}
+
+/**
+ * Invoke the EM repo's /review-all-prs skill, scoped to a single service repo,
+ * in a headless Claude session.
+ *
+ * This is categorically different from implement/revise: those run IN the service
+ * repo under the Foreman token with a narrow tool set. Review is a decision-layer
+ * workflow — it needs the EM repo's MCP servers, npm scripts (healthcheck/verify/
+ * validate), and context/docs — so it runs with:
+ *   - cwd  = the EM repo (agentConfig.emRepoPath), so it loads the EM .mcp.json,
+ *            .claude/skills, and context/docs
+ *   - token = EM_GITHUB_TOKEN, so reviews/merges are attributed to the EM account
+ *             (memory: feedback_mcp_github_for_review_actions)
+ *   - the broad reviewAllowedTools surface (GitHub/Postgres/Redis/Railway MCP)
+ *
+ * Full-fidelity: the skill posts verdicts, merges approved PRs to develop, verifies
+ * dev, files S3/S4 follow-ups, and updates labels itself. The orchestrator does NOT
+ * relabel after a review run — unlike implement/revise, the skill owns its own label
+ * transitions. The review's label side effects feed the existing phases: APPROVE →
+ * `ready for prod release` (promote phase); REQUEST_CHANGES → `pr pending actions`
+ * (revise phase).
+ */
+export async function reviewOpenPRs(
+  repoConfig: RepoConfig,
+  agentConfig: AgentConfig,
+  logger: Logger,
+  abortSignal?: AbortSignal,
+  transcriptPath?: string,
+): Promise<ReviewResult> {
+  const emToken = process.env.EM_GITHUB_TOKEN;
+  if (!emToken) {
+    return { success: false, error: "EM_GITHUB_TOKEN not set — refusing to run review without EM-account attribution" };
+  }
+  if (!agentConfig.emRepoPath) {
+    return { success: false, error: "emRepoPath not configured — cannot locate the review skill" };
+  }
+
+  logger.info(`Starting review for ${repoConfig.name} (${repoConfig.githubRepo}) — cwd=${agentConfig.emRepoPath}`);
+
+  const prompt = `Read and follow the skill at ${agentConfig.reviewSkillPath}.
+
+Review the open feature PRs for the repository \`${repoConfig.githubRepo}\` ONLY. Treat this as the skill's repo-scoped mode (equivalent to \`--repo ${repoConfig.githubRepo}\`): scope every step — inventory, review, merge, verify — to that single repository, and use the full \`owner/repo\` slug \`${repoConfig.githubRepo}\` for all GitHub operations (do not rely on a short repo alias).
+
+Follow the skill exactly and act autonomously — do NOT ask questions or wait for confirmation:
+- Run the relevant healthchecks first (skill Phase 0).
+- Review each open \`features → develop\` PR (skill Phase 3): the Fix-Completeness gate first, then the rubric.
+- For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`ready for prod release\` per the skill.
+- For BLOCKED PRs: post REQUEST_CHANGES, label the linked issue \`pr pending actions\`, and file S3/S4 follow-up issues per the skill.
+- Update issue labels yourself exactly as the skill specifies — the orchestrator will NOT relabel after you.
+
+If there are no open feature PRs awaiting review for this repo, that is a clean no-op — say so and stop.
+
+${IMAGE_HANDLING_INSTRUCTIONS}`;
+
+  const result = await spawnClaudeWithOptions(
+    prompt,
+    {
+      cwd: agentConfig.emRepoPath,
+      ghToken: emToken,
+      model: agentConfig.reviewModel,
+      allowedTools: agentConfig.reviewAllowedTools,
+      maxTurns: agentConfig.reviewMaxTurns,
+      maxDurationMs: agentConfig.reviewMaxDurationMs,
+      streamJson: true,
+      transcriptPath,
+    },
+    logger,
+    abortSignal
+  );
+
+  if (result.timedOut) {
+    return { success: false, error: "timed out" };
+  }
+
+  if (result.exitCode !== 0) {
+    const stderrMsg = result.stderr.trim();
+    const stdoutTail = result.stdout.trim().slice(-500);
+    const error = stderrMsg || stdoutTail || `exit code ${result.exitCode}`;
+    logger.error(`Review Claude CLI exited with code ${result.exitCode}: ${error}`);
+    return { success: false, error };
+  }
+
+  const summary = extractStreamResult(result.stdout);
+  if (summary) {
+    logger.info(`Review completed for ${repoConfig.name}:\n${summary}`);
+  } else {
+    logger.info(`Review completed for ${repoConfig.name} (no parseable summary; see transcript${transcriptPath ? ` ${transcriptPath}` : ""})`);
+  }
+  return { success: true, summary };
 }
