@@ -28,7 +28,12 @@ export interface ReviewResult {
  * Returns a concise human-readable line, or undefined when no trailer is present.
  */
 function parseReviewTrailers(stdout: string): string | undefined {
-  const re = /FOREMAN_REVIEW\s+pr=#?(\d+)\s+verdict=(\S+)\s+merged=(\S+)\s+deploy=(\S+)/gi;
+  // Each field uses a bounded token alphabet ([\w/-]+) so it cannot bleed into
+  // surrounding characters when the trailer is emitted inside a single-line
+  // stream-JSON envelope (the Claude CLI's --output-format=stream-json), where
+  // the characters immediately after the trailer (`"}],"STOP_REASON":NULL,…`)
+  // are non-whitespace and would be greedily absorbed by an unbounded `\S+`.
+  const re = /FOREMAN_REVIEW\s+pr=#?(\d+)\s+verdict=([\w/-]+)\s+merged=([\w/-]+)\s+deploy=([\w/-]+)/gi;
   const parts: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(stdout)) !== null) {
