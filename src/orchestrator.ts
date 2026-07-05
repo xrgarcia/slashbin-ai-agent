@@ -23,7 +23,7 @@ import {
 } from "./github.js";
 import { implementApprovedIssues, revisePRFeedback, reviewOpenPRs, type ImplementationResult, type RevisionResult } from "./agent.js";
 import { reconcileRepo, checkLocalBranchDivergence } from "./reconciler.js";
-import { verifyPRExists } from "./github.js";
+import { verifyPRExists, findStuckMergedIssues } from "./github.js";
 import { loadRepoState, saveRepoState } from "./state.js";
 
 const MAX_RETRIES = 2;
@@ -100,6 +100,27 @@ export async function runCycle(
       reconLogger.error("Reconciliation failed", {
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // Surface dead-zoned issues: PR merged to develop but the issue is still
+    // `pr under review` (post-merge verify failed and no phase recovers it).
+    // Detection only — the EM re-verifies and advances/flags by hand.
+    try {
+      const stuck = findStuckMergedIssues(repoConfig, reconLogger);
+      for (const s of stuck) {
+        reconLogger.warn(
+          `Dead-zoned issue #${s.issueNumber}: PR #${s.prNumber} merged to ${repoConfig.baseBranch} but issue still "pr under review" — post-merge verify never advanced it`,
+          { prUrl: s.prUrl, mergedAt: s.mergedAt },
+        );
+        events.push({
+          message: `⚠️ ${repoConfig.githubRepo} #${s.issueNumber} dead-zoned: PR #${s.prNumber} merged but issue still "pr under review". EM: re-verify (npm run verify --repo ${repoConfig.name} --pr ${s.prNumber} --env development), then advance to "ready for prod release" or flag "pr pending actions".`,
+          level: "warn",
+        });
+      }
+    } catch (err) {
+      reconLogger.debug(
+        `Dead-zone detection failed for ${repoConfig.name}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

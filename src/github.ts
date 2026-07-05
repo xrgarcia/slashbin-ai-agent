@@ -484,6 +484,112 @@ export function findPRsNeedingReview(
   }
 }
 
+export interface StuckMergedIssue {
+  issueNumber: number;
+  prNumber: number;
+  prUrl: string;
+  mergedAt: string;
+}
+
+/** Grace window before a merged-but-unadvanced issue is treated as dead-zoned,
+ *  giving an in-flight post-merge verify time to advance it. Prevents flapping
+ *  on freshly-merged PRs the review agent is still finishing. */
+const STUCK_MERGE_GRACE_MS = 15 * 60 * 1000;
+
+/**
+ * Detect issues DEAD-ZONED by a failed post-merge verify: labeled `pr under
+ * review` with their feature PR already MERGED to the base branch, yet never
+ * advanced to `ready for prod release`. `findPRsNeedingReview` only fires while
+ * the PR is OPEN; once it merges, a failed post-merge verify leaves the issue
+ * pinned at `pr under review` with NO phase that ever recovers it. This surfaces
+ * those so the EM can re-verify and advance/flag by hand.
+ *
+ * DETECTION ONLY — never mutates labels. Auto-advancing on a re-verify would risk
+ * rubber-stamping a genuine regression (a post-merge FAIL is supposed to HOLD);
+ * the safe recovery is to make the stuck state visible, not invisible.
+ *
+ * Conservative by design (returns [] on any ambiguity):
+ *  - skips main-only repos (no features→develop lifecycle)
+ *  - ignores issues also labeled `pr pending actions` (revise owns) or
+ *    `ready for prod release` (already advanced)
+ *  - ignores repos with an OPEN feature PR (normal review-pending; tryReview owns it)
+ *  - only flags PRs merged more than STUCK_MERGE_GRACE_MS ago (no flap on fresh merges)
+ */
+export function findStuckMergedIssues(
+  config: RepoConfig,
+  logger: Logger,
+): StuckMergedIssue[] {
+  if (config.baseBranch === config.featureBranch) return [];
+  try {
+    const issueJson = gh([
+      "issue", "list",
+      "--repo", config.githubRepo,
+      "--state", "open",
+      "--label", "pr under review",
+      "--json", "number,labels",
+      "--limit", "100",
+    ], config.repoPath);
+    const issues: { number: number; labels: { name: string }[] }[] = JSON.parse(issueJson || "[]");
+    const candidates = issues.filter(
+      (i) => !i.labels.some(
+        (l) => l.name === "pr pending actions" || l.name === "ready for prod release",
+      ),
+    );
+    if (candidates.length === 0) return [];
+
+    // An OPEN feature PR means these are normal review-pending — tryReview owns them.
+    const openJson = gh([
+      "pr", "list",
+      "--repo", config.githubRepo,
+      "--state", "open",
+      "--head", config.featureBranch,
+      "--base", config.baseBranch,
+      "--json", "number",
+      "--limit", "1",
+    ], config.repoPath);
+    if ((JSON.parse(openJson || "[]") as unknown[]).length > 0) return [];
+
+    // Recent merged feature PRs, matched against stuck issues by referenced number.
+    const mergedJson = gh([
+      "pr", "list",
+      "--repo", config.githubRepo,
+      "--state", "merged",
+      "--base", config.baseBranch,
+      "--json", "number,url,title,body,mergedAt",
+      "--limit", "30",
+    ], config.repoPath);
+    const merged: {
+      number: number; url: string; title: string; body: string; mergedAt: string;
+    }[] = JSON.parse(mergedJson || "[]");
+
+    const nowMs = Date.now();
+    const stuck: StuckMergedIssue[] = [];
+    for (const issue of candidates) {
+      const ref = new RegExp(`#${issue.number}(?!\\d)`);
+      const pr = merged.find(
+        (m) =>
+          (ref.test(m.body || "") || ref.test(m.title || "")) &&
+          !!m.mergedAt &&
+          nowMs - new Date(m.mergedAt).getTime() > STUCK_MERGE_GRACE_MS,
+      );
+      if (pr) {
+        stuck.push({
+          issueNumber: issue.number,
+          prNumber: pr.number,
+          prUrl: pr.url,
+          mergedAt: pr.mergedAt,
+        });
+      }
+    }
+    return stuck;
+  } catch (err) {
+    logger.debug(
+      `findStuckMergedIssues failed for ${config.name}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
 /**
  * True when the PR already has an APPROVED/CHANGES_REQUESTED review by
  * `reviewerLogin` submitted at or after the PR's latest commit (i.e. the current
