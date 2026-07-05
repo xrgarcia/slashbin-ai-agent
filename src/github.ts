@@ -10,30 +10,75 @@ interface GhIssue {
   url: string;
 }
 
+const GH_MAX_ATTEMPTS = 3;
+const GH_BACKOFF_MS = [1000, 3000, 9000];
+
+/** Block the thread for `ms` without busy-waiting. Only hit on the rare retry
+ *  path; keeps the gh() wrapper synchronous so no caller signature changes. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms));
+}
+
+/**
+ * A gh failure is *transient* (safe to retry) only when it's network/connectivity
+ * or a server-side 5xx/timeout — NOT auth, 404, or 422 validation, which won't
+ * improve on retry (those fall through to an immediate throw). Allowlist by design.
+ * A host↔GitHub blip ("error connecting to api.github.com") was stalling the whole
+ * fleet ("No work across all repos"); retrying absorbs it instead of erroring the cycle.
+ */
+function isTransientGhError(err: unknown): boolean {
+  const { message, stderr } = formatGhError(err);
+  const blob = `${message}\n${stderr}`.toLowerCase();
+  return (
+    blob.includes("error connecting to api.github.com") ||
+    blob.includes("timed out") || blob.includes("timeout") ||
+    blob.includes("etimedout") || blob.includes("econnreset") ||
+    blob.includes("enotfound") || blob.includes("eai_again") ||
+    blob.includes("dial tcp") ||
+    blob.includes("bad gateway") || blob.includes("service unavailable") ||
+    blob.includes("http 502") || blob.includes("http 503") || blob.includes("http 504")
+  );
+}
+
+/** execFileSync gh with retry+backoff on transient (network/5xx/timeout) failures. */
+function runGh(args: string[], cwd: string, token: string): string {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= GH_MAX_ATTEMPTS; attempt++) {
+    try {
+      return execFileSync("gh", args, {
+        cwd,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 30_000,
+        env: { ...process.env, GH_TOKEN: token },
+      }).trim();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < GH_MAX_ATTEMPTS && isTransientGhError(err)) {
+        const wait = GH_BACKOFF_MS[attempt - 1];
+        const { message, stderr } = formatGhError(err);
+        console.warn(`[gh] transient failure (attempt ${attempt}/${GH_MAX_ATTEMPTS}), retrying in ${wait}ms: ${stderr.split("\n")[0] || message}`);
+        sleepSync(wait);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 /** Run gh CLI using the Foreman token (slashbin-foreman account). */
 export function gh(args: string[], cwd: string): string {
   const foremanToken = process.env.FOREMAN_GITHUB_TOKEN;
   if (!foremanToken) throw new Error("FOREMAN_GITHUB_TOKEN not set — cannot operate as Foreman");
-  return execFileSync("gh", args, {
-    cwd,
-    encoding: "utf-8",
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 30_000,
-    env: { ...process.env, GH_TOKEN: foremanToken },
-  }).trim();
+  return runGh(args, cwd, foremanToken);
 }
 
 /** Run gh CLI using the EM token (slashbin-engineering-manager account). */
 function ghAsEM(args: string[], cwd: string): string {
   const emToken = process.env.EM_GITHUB_TOKEN;
   if (!emToken) throw new Error("EM_GITHUB_TOKEN not set — cannot approve/merge as EM");
-  return execFileSync("gh", args, {
-    cwd,
-    encoding: "utf-8",
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 30_000,
-    env: { ...process.env, GH_TOKEN: emToken },
-  }).trim();
+  return runGh(args, cwd, emToken);
 }
 
 /**
