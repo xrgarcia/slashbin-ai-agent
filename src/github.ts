@@ -427,6 +427,15 @@ export interface ReviewCandidate {
  * remaining window where a review run crashed after posting its verdict but before
  * relabeling — without it the same PR would be re-reviewed every cycle.
  *
+ * Self-heal fallback: when no issue carries `pr under review` but an open feature
+ * PR exists, the implement phase opened the PR but never applied the label (the
+ * transition step swallows errors, and the process can die between `gh pr create`
+ * and `transitionImplementationLabels`). GitHub — the actual open PR — is the
+ * source of truth for whether review is needed; the label is a tracking artifact.
+ * `adoptOrphanedReviewCandidate` finds linked issues from the PR title/body,
+ * applies `pr under review` to them, and returns the candidate so the review runs
+ * this cycle instead of hanging forever waiting for a label that never lands.
+ *
  * Returns null when there's nothing to review.
  */
 export function findPRsNeedingReview(
@@ -447,7 +456,9 @@ export function findPRsNeedingReview(
     const issues: { number: number; labels: { name: string }[] }[] = JSON.parse(issueJson || "[]");
     // Exclude issues also labeled `pr pending actions` — the revise phase owns those.
     const reviewable = issues.filter((i) => !i.labels.some((l) => l.name === "pr pending actions"));
-    if (reviewable.length === 0) return null;
+    if (reviewable.length === 0) {
+      return adoptOrphanedReviewCandidate(config, reviewerLogin, logger);
+    }
 
     // Confirm an open feature PR exists (features → develop).
     const prJson = gh([
@@ -482,6 +493,90 @@ export function findPRsNeedingReview(
     });
     return null;
   }
+}
+
+/**
+ * Fallback for `findPRsNeedingReview`: an open feature PR exists but no linked
+ * issue carries `pr under review`. The implement phase opened the PR then failed
+ * (silently) to apply the label — or crashed between `gh pr create` and
+ * `transitionImplementationLabels`. Recover by extracting linked issue refs from
+ * the PR title/body, applying `pr under review` to those that still carry the
+ * trigger label, and returning a candidate so the review runs this cycle.
+ *
+ * Safety filters (only adopt issues we clearly own):
+ *  - OPEN state
+ *  - carries `config.triggerLabel` (default `approved`)
+ *  - NOT `pr pending actions` (revise phase owns those)
+ *  - NOT `ready for prod release` (already advanced)
+ */
+function adoptOrphanedReviewCandidate(
+  config: RepoConfig,
+  reviewerLogin: string,
+  logger: Logger,
+): ReviewCandidate | null {
+  const prJson = gh([
+    "pr", "list",
+    "--repo", config.githubRepo,
+    "--state", "open",
+    "--head", config.featureBranch,
+    "--base", config.baseBranch,
+    "--json", "number,url,title,body",
+    "--limit", "1",
+  ], config.repoPath);
+
+  const prs: { number: number; url: string; title: string; body: string }[] = JSON.parse(prJson || "[]");
+  if (prs.length === 0) return null;
+  const pr = prs[0];
+
+  if (hasFreshReview(config, pr.number, reviewerLogin, logger)) return null;
+
+  const refs = new Set<number>();
+  const combined = `${pr.title}\n${pr.body ?? ""}`;
+  for (const m of combined.matchAll(/#(\d+)/g)) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n !== pr.number) refs.add(n);
+  }
+  if (refs.size === 0) {
+    logger.debug(`${config.name}: PR #${pr.number} has no "pr under review" label and no linked issues found in title/body`);
+    return null;
+  }
+
+  const adopted: number[] = [];
+  for (const num of refs) {
+    try {
+      const raw = gh([
+        "issue", "view", String(num),
+        "--repo", config.githubRepo,
+        "--json", "state,labels",
+      ], config.repoPath);
+      const info: { state: string; labels: { name: string }[] } = JSON.parse(raw);
+      if (info.state !== "OPEN") continue;
+      const names = new Set(info.labels.map((l) => l.name));
+      if (!names.has(config.triggerLabel)) continue;
+      if (names.has("pr pending actions")) continue;
+      if (names.has("ready for prod release")) continue;
+      try {
+        gh([
+          "issue", "edit", String(num),
+          "--repo", config.githubRepo,
+          "--add-label", "pr under review",
+        ], config.repoPath);
+        logger.warn(`${config.name}: adopted orphaned issue #${num} → PR #${pr.number} (implement phase never applied "pr under review")`);
+      } catch (err) {
+        logger.warn(`${config.name}: failed to add "pr under review" on adopted #${num}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      adopted.push(num);
+    } catch (err) {
+      logger.debug(`${config.name}: could not inspect referenced #${num}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (adopted.length === 0) {
+    logger.debug(`${config.name}: PR #${pr.number} is orphaned but no referenced issue is a review candidate (missing ${config.triggerLabel}, or owned by revise/prod)`);
+    return null;
+  }
+
+  logger.info(`${config.name}: adopted orphaned PR #${pr.number} for review (issues: ${adopted.map((n) => `#${n}`).join(", ")})`);
+  return { prNumber: pr.number, prUrl: pr.url, issueNumbers: adopted };
 }
 
 export interface StuckMergedIssue {
