@@ -194,9 +194,27 @@ export function extractImplementedIssues(opts: {
   body?: string;
   commitHeadlines?: string[];
   commitBodies?: string[];
+  /**
+   * STRICT mode — accept only *closing* keywords (`closes`/`fixes`/`resolves`),
+   * dropping the weak affinity keywords (`related to`, `refs`, `see`).
+   *
+   * Default (false) is the historical predicate, correct for the PR-labeling path
+   * where the consequence is merely ADDING `pr under review` — over-matching there
+   * is cheap and recoverable.
+   *
+   * Strict is required by any TERMINAL transition (one that strips the trigger
+   * label and declares work done), where a false positive permanently marks
+   * unbuilt work as complete. "Related to #N" is not a claim of implementation —
+   * and the Foreman's OWN reconciler writes `- Related to #N` into every recovery
+   * PR body (reconciler.ts), so the loose predicate would terminally close issues
+   * nobody built. That is slashbin-ai-foreman#28's bug with a worse blast radius.
+   */
+  strict?: boolean;
 }): number[] {
-  const { title = "", body = "", commitHeadlines = [], commitBodies = [] } = opts;
-  const keywordRe = /\b(?:related\s+to|closes?|fixes?|resolves?|refs?|see)\s*:?\s*#(\d+)/gi;
+  const { title = "", body = "", commitHeadlines = [], commitBodies = [], strict = false } = opts;
+  const keywordRe = strict
+    ? /\b(?:closes?|fixes?|resolves?)\s*:?\s*#(\d+)/gi
+    : /\b(?:related\s+to|closes?|fixes?|resolves?|refs?|see)\s*:?\s*#(\d+)/gi;
   const suffixRe = /\(#(\d+)\)/g;
   const found = new Set<number>();
 
@@ -579,12 +597,129 @@ function adoptOrphanedReviewCandidate(
   return { prNumber: pr.number, prUrl: pr.url, issueNumbers: adopted };
 }
 
-export interface StuckMergedIssue {
+export interface MergedIssueRef {
   issueNumber: number;
   prNumber: number;
   prUrl: string;
   mergedAt: string;
 }
+
+/**
+ * THE shared primitive: of `candidates`, which issues' work is already MERGED to
+ * `baseBranch`? Resolved by running each recently-merged PR through the STRICT
+ * implemented-issue predicate — a merged PR must say it *closed* the issue
+ * (`closes`/`fixes`/`resolves #N`, or `(#N)` in the title / a commit headline).
+ * A mere "related to #N" does not count. See extractImplementedIssues({strict}).
+ *
+ * Two callers, two DIFFERENT policies — the distinction that matters is
+ * *did a gate reject this work?*:
+ *   - implement-skip (slashbin-ai-foreman#32): no gate ever ran, the work is just
+ *     merged with no lifecycle label → AUTO-ADVANCE to the terminal state.
+ *   - findStuckMergedIssues: post-merge verify FAILED → NEVER auto-advance
+ *     (a gate rejected it); surface to the EM instead.
+ *
+ * Conservative: returns [] on any lookup failure — under-advancing is safe
+ * (status quo), over-advancing marks unbuilt work as done.
+ */
+export function findIssuesMergedToBase(
+  config: RepoConfig,
+  candidates: number[],
+  logger: Logger,
+): MergedIssueRef[] {
+  if (candidates.length === 0) return [];
+  try {
+    const json = gh([
+      "pr", "list",
+      "--repo", config.githubRepo,
+      "--state", "merged",
+      "--base", config.baseBranch,
+      "--json", "number,url,title,body,commits,mergedAt",
+      "--limit", "30",
+    ], config.repoPath);
+    const prs = JSON.parse(json || "[]") as {
+      number: number;
+      url: string;
+      title?: string;
+      body?: string;
+      commits?: { messageHeadline?: string; messageBody?: string }[];
+      mergedAt?: string;
+    }[];
+
+    const wanted = new Set(candidates);
+    const hits = new Map<number, MergedIssueRef>();
+    for (const pr of prs) {
+      const commits = pr.commits ?? [];
+      const closed = extractImplementedIssues({
+        title: pr.title || "",
+        body: pr.body || "",
+        commitHeadlines: commits.map((c) => c.messageHeadline || ""),
+        commitBodies: commits.map((c) => c.messageBody || ""),
+        strict: true,
+      });
+      for (const n of closed) {
+        // Never match a PR against its OWN number: GitHub's squash-merge appends
+        // "(#<pr>)" to the commit headline, which the `(#N)` rule would otherwise
+        // read as "this PR closed issue #<pr>". Harmless today (issues and PRs
+        // share one number sequence, so a PR number is never an issue number) —
+        // guarded anyway so it can't become a real false-advance later.
+        if (n === pr.number) continue;
+        // Keep the FIRST (most recent — gh lists newest-first) merged PR per issue.
+        if (wanted.has(n) && !hits.has(n) && pr.mergedAt) {
+          hits.set(n, {
+            issueNumber: n,
+            prNumber: pr.number,
+            prUrl: pr.url,
+            mergedAt: pr.mergedAt,
+          });
+        }
+      }
+    }
+    return [...hits.values()].sort((a, b) => a.issueNumber - b.issueNumber);
+  } catch (err) {
+    logger.warn("findIssuesMergedToBase: gh pr list failed — advancing nothing", {
+      ...formatGhError(err),
+      repo: config.githubRepo,
+    });
+    return [];
+  }
+}
+
+/**
+ * TERMINAL transition (slashbin-ai-foreman#32): the issue's work is already merged
+ * to the base branch. Strip the trigger label so the issue permanently leaves the
+ * actionable set, and add `ready for prod release` — the EXISTING label meaning
+ * "implemented, awaiting EM prod verification + close."
+ *
+ * Stripping `triggerLabel` is the load-bearing half: without it the issue stays
+ * "actionable" forever and the Foreman burns a full Claude session every back-off
+ * window concluding there is nothing to do. Uses `config.triggerLabel` rather than
+ * a hard-coded "approved" — the trigger label is configurable (OSS).
+ */
+export function transitionToReadyForProd(
+  config: RepoConfig,
+  issueNumbers: number[],
+  logger: Logger,
+): void {
+  for (const num of issueNumbers) {
+    try {
+      gh([
+        "issue", "edit", String(num),
+        "--repo", config.githubRepo,
+        "--remove-label", config.triggerLabel,
+        "--add-label", "ready for prod release",
+      ], config.repoPath);
+      logger.info(
+        `Terminal transition on #${num}: removed "${config.triggerLabel}", added "ready for prod release" (work already merged to ${config.baseBranch})`,
+      );
+    } catch (err) {
+      logger.warn(
+        `Failed terminal transition on #${num}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
+
+export type StuckMergedIssue = MergedIssueRef;
 
 /** Grace window before a merged-but-unadvanced issue is treated as dead-zoned,
  *  giving an in-flight post-merge verify time to advance it. Prevents flapping
@@ -644,39 +779,19 @@ export function findStuckMergedIssues(
     ], config.repoPath);
     if ((JSON.parse(openJson || "[]") as unknown[]).length > 0) return [];
 
-    // Recent merged feature PRs, matched against stuck issues by referenced number.
-    const mergedJson = gh([
-      "pr", "list",
-      "--repo", config.githubRepo,
-      "--state", "merged",
-      "--base", config.baseBranch,
-      "--json", "number,url,title,body,mergedAt",
-      "--limit", "30",
-    ], config.repoPath);
-    const merged: {
-      number: number; url: string; title: string; body: string; mergedAt: string;
-    }[] = JSON.parse(mergedJson || "[]");
+    // Resolve merged work via the SHARED strict primitive — not a bare `#N` scan.
+    // A bare-`#N` match would false-positive on an incidental prose mention
+    // (slashbin-ai-foreman#28), flagging issues that were never actually merged.
+    const merged = findIssuesMergedToBase(
+      config,
+      candidates.map((i) => i.number),
+      logger,
+    );
 
     const nowMs = Date.now();
-    const stuck: StuckMergedIssue[] = [];
-    for (const issue of candidates) {
-      const ref = new RegExp(`#${issue.number}(?!\\d)`);
-      const pr = merged.find(
-        (m) =>
-          (ref.test(m.body || "") || ref.test(m.title || "")) &&
-          !!m.mergedAt &&
-          nowMs - new Date(m.mergedAt).getTime() > STUCK_MERGE_GRACE_MS,
-      );
-      if (pr) {
-        stuck.push({
-          issueNumber: issue.number,
-          prNumber: pr.number,
-          prUrl: pr.url,
-          mergedAt: pr.mergedAt,
-        });
-      }
-    }
-    return stuck;
+    return merged.filter(
+      (m) => nowMs - new Date(m.mergedAt).getTime() > STUCK_MERGE_GRACE_MS,
+    );
   } catch (err) {
     logger.debug(
       `findStuckMergedIssues failed for ${config.name}: ${err instanceof Error ? err.message : String(err)}`,

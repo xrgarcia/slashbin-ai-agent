@@ -9,6 +9,12 @@ interface FailedIssue {
 interface SkippedIssue {
   lastSkippedAt: string; // ISO timestamp
   reason: string;
+  // Consecutive times the agent has skipped this issue. Drives the ESCALATING
+  // back-off (a fixed snooze never gives up, so a permanently-unactionable issue
+  // costs one agent session per window forever — slashbin-ai-foreman#32).
+  // Optional for backward compat with state files written before this field existed;
+  // absent is read as 0, i.e. the original single-window behavior.
+  skipCount?: number;
 }
 
 export interface RepoState {

@@ -23,7 +23,12 @@ import {
 } from "./github.js";
 import { implementApprovedIssues, revisePRFeedback, reviewOpenPRs, type ImplementationResult, type RevisionResult } from "./agent.js";
 import { reconcileRepo, checkLocalBranchDivergence } from "./reconciler.js";
-import { verifyPRExists, findStuckMergedIssues } from "./github.js";
+import {
+  verifyPRExists,
+  findStuckMergedIssues,
+  findIssuesMergedToBase,
+  transitionToReadyForProd,
+} from "./github.js";
 import { loadRepoState, saveRepoState } from "./state.js";
 
 const MAX_RETRIES = 2;
@@ -149,7 +154,7 @@ export async function runCycle(
 
   // --- Phase 3: Implement approved issues (one batch per repo) ---
   for (const repoConfig of config.repos) {
-    const result = await tryBatchImplementation(repoConfig, logger, cycleNumber, events);
+    const result = await tryBatchImplementation(repoConfig, config, logger, cycleNumber, events);
     if (result) {
       totalProcessed++;
       lastResult = result;
@@ -225,13 +230,38 @@ function isResolvedTransientSkip(
   return false;
 }
 
+/** Hard ceiling on the escalating skip back-off — 24h. Beyond this the retry rate
+ *  is already negligible, and we still want an eventual re-check in case the
+ *  world changed (issue body edited, dependency landed). */
+const SKIP_BACKOFF_MAX_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Escalating back-off window for the Nth consecutive skip of one issue:
+ * base * 2^(N-1), capped (30m → 1h → 2h → 4h → … → 24h at the default base).
+ *
+ * A FIXED snooze is not a back-off: it never gives up, so an issue that can never
+ * become actionable costs one full Claude session every window, forever
+ * (slashbin-ai-foreman#32). Escalating bounds the cost of ANY repeating skip —
+ * investigation-only issues, blocked-on-external, and merged-work alike.
+ *
+ * skipCount is optional in persisted state (pre-#32 files) — absent reads as the
+ * first skip, i.e. exactly the original single-window behavior.
+ */
+function backoffWindowFor(skipCount: number | undefined, baseMs: number): number {
+  const n = Math.max(1, skipCount ?? 1);
+  const exp = Math.min(n - 1, 10); // 2^10 * 30m ≫ cap; guards against overflow
+  return Math.min(baseMs * 2 ** exp, SKIP_BACKOFF_MAX_MS);
+}
+
 async function tryBatchImplementation(
   repoConfig: RepoConfig,
+  config: AgentConfig,
   logger: Logger,
   cycleNumber: number,
   events?: CycleEvent[]
 ): Promise<ImplementationResult | null> {
   const repoName = repoConfig.name;
+  const skipBackoffMs = config.skipBackoffMs;
   const repoLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "implement" });
 
   // Check if this repo has exceeded batch failure retries
@@ -312,7 +342,6 @@ async function tryBatchImplementation(
   // the stale skip entry. This prevents the cache from pinning a dead-zone
   // 30 minutes past an already-applied manual reconcile.
   const skippedMap = repoState.skipped ?? {};
-  const SKIP_BACKOFF_MS = 30 * 60 * 1000; // 30 min
   const now = Date.now();
   const stillBackedOff: { n: number; reason: string }[] = [];
   const resolvedTransient: { n: number; reason: string }[] = [];
@@ -320,7 +349,7 @@ async function tryBatchImplementation(
     const entry = skippedMap[n];
     if (!entry) return true;
     const age = now - new Date(entry.lastSkippedAt).getTime();
-    if (Number.isNaN(age) || age >= SKIP_BACKOFF_MS) return true;
+    if (Number.isNaN(age) || age >= backoffWindowFor(entry.skipCount, skipBackoffMs)) return true;
     if (isResolvedTransientSkip(entry.reason, repoConfig.repoPath, repoLogger)) {
       resolvedTransient.push({ n, reason: entry.reason });
       return true;
@@ -474,13 +503,57 @@ async function tryBatchImplementation(
       // Do NOT increment failureCount — this isn't an error.
       const updatedState = loadRepoState(repoName);
       if (!updatedState.skipped) updatedState.skipped = {};
-      const skippedSet = result.skippedIssues && result.skippedIssues.length > 0
+      let skippedSet = result.skippedIssues && result.skippedIssues.length > 0
         ? result.skippedIssues
         : actionableIssues;
       const reason = result.skipReason ?? "no reason given";
+
+      // --- Case 4 (slashbin-ai-foreman#32): the work is ALREADY MERGED ---------
+      // A skip is only worth retrying if a retry could ever succeed. When the
+      // agent declines because the work is already on `baseBranch`, retrying is
+      // futile BY DEFINITION — the commits exist; no future cycle will produce a
+      // PR for them. Yet the issue keeps `approved` with no lifecycle label, so
+      // it stays "actionable" and we burn a full Claude session every back-off
+      // window, forever (observed: 7+ hours across two repos, 2026-07-13).
+      //
+      // Give the lifecycle its missing EXIT: strip the trigger label and advance
+      // to `ready for prod release`, permanently removing the issue from the
+      // actionable set and handing the EM the signal it already expects. Forward
+      // progress then no longer depends on a human closing the issue promptly.
+      //
+      // Safe because findIssuesMergedToBase() uses the STRICT predicate: only a
+      // merged PR that says it CLOSED the issue counts (never a "related to #N").
+      // On any lookup failure it advances nothing — we under-advance by design.
+      const alreadyMerged = findIssuesMergedToBase(repoConfig, skippedSet, repoLogger);
+      if (alreadyMerged.length > 0) {
+        const mergedNums = alreadyMerged.map((m) => m.issueNumber);
+        transitionToReadyForProd(repoConfig, mergedNums, repoLogger);
+        repoLogger.info(
+          `Advanced ${mergedNums.length} already-merged issue(s) to 'ready for prod release': ${alreadyMerged.map((m) => `#${m.issueNumber} (merged in PR #${m.prNumber})`).join(", ")}`,
+        );
+        events?.push({
+          message: `Advanced ${mergedNums.length} already-merged issue(s) on ${repoConfig.githubRepo} to 'ready for prod release': ${mergedNums.map((n) => `#${n}`).join(", ")}`,
+          level: "info",
+        });
+        // They're out of the actionable set now — no skip record needed, and a
+        // stale one would linger in state forever.
+        for (const n of mergedNums) delete updatedState.skipped[n];
+        skippedSet = skippedSet.filter((n) => !mergedNums.includes(n));
+      }
+      // ------------------------------------------------------------------------
+
       const stamp = new Date().toISOString();
       for (const issueNum of skippedSet) {
-        updatedState.skipped[issueNum] = { lastSkippedAt: stamp, reason };
+        // Escalating per-issue back-off: a fixed snooze never gives up, so a
+        // permanently-unactionable issue costs an agent session every window,
+        // indefinitely. Count the consecutive skips; the filter at the top of
+        // this function widens the window geometrically off this count.
+        const priorCount = updatedState.skipped[issueNum]?.skipCount ?? 0;
+        updatedState.skipped[issueNum] = {
+          lastSkippedAt: stamp,
+          reason,
+          skipCount: priorCount + 1,
+        };
       }
       saveRepoState(repoName, updatedState);
       // Reset the failure counter — an explicit skip is not a failure.

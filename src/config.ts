@@ -38,6 +38,12 @@ const configSchema = z.object({
 
   // Global settings
   pollIntervalMs: z.coerce.number().int().positive().default(300_000),
+  // Base window for the escalating per-issue skip back-off. The Nth consecutive
+  // skip of an issue waits skipBackoffMs * 2^(N-1), capped at SKIP_BACKOFF_MAX_MS.
+  // Additive + OSS-safe: defaults to the historical fixed 30 min, so an existing
+  // .ai-agent.json keeps working with no new key (the first window is unchanged;
+  // only repeat skips of the SAME issue back off further). slashbin-ai-foreman#32.
+  skipBackoffMs: z.coerce.number().int().positive().default(1_800_000),
   maxTurns: z.coerce.number().int().positive().default(30),
   maxDurationMs: z.coerce.number().int().positive().default(1_800_000),
   allowedTools: z.array(z.string()).default(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
@@ -111,6 +117,8 @@ export interface RepoConfig {
 export interface AgentConfig {
   repos: readonly RepoConfig[];
   pollIntervalMs: number;
+  /** Base window for the escalating per-issue skip back-off (default 30 min). */
+  skipBackoffMs: number;
   logFormat: "json" | "text";
   logLevel: "debug" | "info" | "warn" | "error";
 
@@ -165,6 +173,7 @@ export function loadConfig(configPath?: string): AgentConfig {
     githubRepo: process.env.AI_AGENT_GITHUB_REPO ?? fileConfig.githubRepo,
     triggerLabel: process.env.AI_AGENT_TRIGGER_LABEL ?? fileConfig.triggerLabel,
     pollIntervalMs: process.env.AI_AGENT_POLL_INTERVAL_MS ?? fileConfig.pollIntervalMs,
+    skipBackoffMs: process.env.AI_AGENT_SKIP_BACKOFF_MS ?? fileConfig.skipBackoffMs,
     skillPath: process.env.AI_AGENT_SKILL_PATH ?? fileConfig.skillPath,
     prompt: process.env.AI_AGENT_PROMPT ?? fileConfig.prompt,
     baseBranch: process.env.AI_AGENT_BASE_BRANCH ?? fileConfig.baseBranch,
@@ -274,6 +283,7 @@ export function loadConfig(configPath?: string): AgentConfig {
   return Object.freeze({
     repos: Object.freeze(repos),
     pollIntervalMs: parsed.pollIntervalMs,
+    skipBackoffMs: parsed.skipBackoffMs,
     logFormat: parsed.logFormat,
     logLevel: parsed.logLevel,
     emRepoPath,
