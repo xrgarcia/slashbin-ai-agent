@@ -800,9 +800,36 @@ function tryPromotion(
   // no-op promotion PR — the ping-pong bug.
   const diffFiles = countBranchDiffFiles(repoConfig.githubRepo, "main", "develop", repoConfig.repoPath, promoLogger);
   if (diffFiles === 0) {
-    promoLogger.info(
-      `Skipping promotion — develop has no file changes vs main despite ${issues.length} ready-for-prod issue(s). ` +
-      `Likely a race with EM verification stripping labels after a recent promotion merged. Labels will clear on next verify cycle.`
+    // TERMINAL EXIT for the promote lifecycle (slashbin-ai-foreman#32, promote variant).
+    //
+    // develop has ZERO file changes vs main, so every ready-for-prod issue's work
+    // is ALREADY in main — it was promoted, and there is nothing left to promote.
+    // Retrying is futile by construction; no future cycle can produce a diff.
+    //
+    // This used to just log "labels will clear on next verify cycle" and return.
+    // They never cleared: stripReadyForProdLabel() is only reachable on the
+    // promotion-PR-created path below, so an already-promoted issue kept the label
+    // forever and this phase re-checked it EVERY cycle, indefinitely. Observed on
+    // jerky_security_testing #110/#115/#117/#118/#122 — stuck from 2026-07-01 for
+    // two weeks, burning a promote check every poll, while their fixes had shipped
+    // to main (and deployed) on day one. The "likely a race" comment was a wrong
+    // assumption that made a permanent stuck state read as self-healing.
+    //
+    // Safe: `ready for prod release` is only applied after the feature PR merges to
+    // develop, so develop-content == main-content ⇒ that work IS in main. Strip the
+    // label to remove them from the promote set. We do NOT close them — the EM still
+    // owns outcome verification; an open issue with no lifecycle label is inert
+    // (the Foreman won't re-pick it) and stays visible for that close.
+    promoLogger.warn(
+      `Already promoted — ${issues.length} issue(s) still labeled 'ready for prod release' but develop has 0 file changes vs main, ` +
+      `so their work is already in main: ${issues.map((i) => `#${i.number}`).join(", ")}. ` +
+      `Stripping the label (nothing left to promote). They remain open for EM outcome-verification + close.`,
+    );
+    stripReadyForProdLabel(
+      repoConfig.githubRepo,
+      issues.map((i) => i.number),
+      repoConfig.repoPath,
+      promoLogger,
     );
     return null;
   }
