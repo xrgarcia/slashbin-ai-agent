@@ -43,6 +43,11 @@ const revisionFailureCount = new Map<string, number>();
 const reviewFailureCount = new Map<string, number>();
 const reviewFailureHitMaxAt = new Map<string, number>();
 
+/** Per-repo set of issue numbers already alerted as dead-zoned, so a STANDING
+ *  condition alerts once instead of every reconcile cycle. Cleared per-issue when
+ *  the issue leaves the dead-zone, so a genuine re-entry alerts again. */
+const deadZoneAlerted = new Map<string, Set<number>>();
+
 const FAILURE_COOLDOWN_CYCLES = 3; // retry after this many idle cycles
 const lastFailureReason = new Map<string, string>(); // per-repo last failure for retry context
 
@@ -110,9 +115,21 @@ export async function runCycle(
     // Surface dead-zoned issues: PR merged to develop but the issue is still
     // `pr under review` (post-merge verify failed and no phase recovers it).
     // Detection only — the EM re-verifies and advances/flags by hand.
+    //
+    // ALERT ONCE per (repo, issue). The dead-zone is a STANDING condition, not an
+    // event: it persists every cycle until the EM clears it, so re-emitting each
+    // reconcile pass floods Discord with the identical line (~every 2 min) and
+    // trains the reader to ignore the channel — the alarm defeats itself.
+    // Observed 2026-07-19 on Slashbin-console#661 (Ray: "i keep seeing this
+    // messages"). The warning fires on transition INTO the dead-zone; the entry
+    // clears when the issue leaves it, so a genuine re-entry alerts again.
     try {
       const stuck = findStuckMergedIssues(repoConfig, reconLogger);
+      const seen = deadZoneAlerted.get(repoConfig.name) ?? new Set<number>();
+      const current = new Set(stuck.map((s) => s.issueNumber));
       for (const s of stuck) {
+        if (seen.has(s.issueNumber)) continue; // already alerted; still stuck
+        seen.add(s.issueNumber);
         reconLogger.warn(
           `Dead-zoned issue #${s.issueNumber}: PR #${s.prNumber} merged to ${repoConfig.baseBranch} but issue still "pr under review" — post-merge verify never advanced it`,
           { prUrl: s.prUrl, mergedAt: s.mergedAt },
@@ -122,6 +139,9 @@ export async function runCycle(
           level: "warn",
         });
       }
+      // Drop cleared issues so a real re-entry alerts again.
+      for (const n of [...seen]) if (!current.has(n)) seen.delete(n);
+      deadZoneAlerted.set(repoConfig.name, seen);
     } catch (err) {
       reconLogger.debug(
         `Dead-zone detection failed for ${repoConfig.name}: ${err instanceof Error ? err.message : String(err)}`,
