@@ -154,16 +154,33 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
       sleepResolve = null;
     }
 
-    // If currently implementing, abort with timeout
+    // If currently implementing, drain before aborting.
+    //
+    // This used to wait a flat 60s and then abort. That silently contradicted
+    // the systemd unit, which sets TimeoutStopSec=1800 precisely so a restart
+    // does NOT kill work mid-flight — systemd would wait 30 minutes while the
+    // daemon gave up after one, SIGTERMing the `claude` child and leaving a
+    // half-built branch behind. An implementation run is budgeted
+    // maxDurationMs (30 min by default), so the drain window has to match that
+    // budget, not undercut it by 30x.
+    //
+    // Override with AI_AGENT_SHUTDOWN_DRAIN_MS when you deliberately want a
+    // fast, work-destroying stop.
+    // maxDurationMs is resolved per-repo, not globally, so take the largest
+    // budget any watched repo could be mid-way through.
+    const longestRun = config.repos.reduce((m, r) => Math.max(m, r.maxDurationMs), 0);
+    const drainMs =
+      Number(process.env.AI_AGENT_SHUTDOWN_DRAIN_MS) ||
+      Math.max(longestRun, config.reviewMaxDurationMs);
     const ac = getAbortController();
     if (ac) {
-      logger.info("Waiting for in-progress implementation to finish (60s timeout)...");
-      const deadline = Date.now() + 60_000;
+      logger.info(`Waiting for in-progress implementation to finish (${Math.round(drainMs / 1000)}s timeout)...`);
+      const deadline = Date.now() + drainMs;
       while (getAbortController() && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 1000));
       }
       if (getAbortController()) {
-        logger.warn("Aborting in-progress implementation");
+        logger.warn("Drain window elapsed — aborting in-progress implementation");
         ac.abort();
       }
     }
