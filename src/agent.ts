@@ -568,7 +568,7 @@ Work autonomously. Do not ask questions.`;
  * dev, files S3/S4 follow-ups, and updates labels itself. The orchestrator does NOT
  * relabel after a review run — unlike implement/revise, the skill owns its own label
  * transitions. The review's label side effects feed the existing phases: APPROVE →
- * `ready for prod release` (promote phase); REQUEST_CHANGES → `pr pending actions`
+ * `pr approved` (awaiting the EM outcome-gate); REQUEST_CHANGES → `pr pending actions`
  * (revise phase).
  */
 export async function reviewOpenPRs(
@@ -595,7 +595,7 @@ Review the open feature PRs for the repository \`${repoConfig.githubRepo}\` ONLY
 Follow the skill exactly and act autonomously — do NOT ask questions or wait for confirmation:
 - Run the relevant healthchecks first (skill Phase 0).
 - Review each open \`features → develop\` PR (skill Phase 3): the Fix-Completeness gate first, then the rubric.
-- For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`ready for prod release\` per the skill.
+- For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`pr approved\` per the skill. Do NOT apply \`ready for prod release\` — that label is the EM outcome-gate's signature (separation of duties; see /review-pr Step 17).
 - For BLOCKED PRs: post REQUEST_CHANGES, label the linked issue \`pr pending actions\`, and file S3/S4 follow-up issues per the skill.
 - Update issue labels yourself exactly as the skill specifies — the orchestrator will NOT relabel after you.
 

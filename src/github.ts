@@ -687,8 +687,12 @@ export function findIssuesMergedToBase(
 /**
  * TERMINAL transition (slashbin-ai-foreman#32): the issue's work is already merged
  * to the base branch. Strip the trigger label so the issue permanently leaves the
- * actionable set, and add `ready for prod release` — the EXISTING label meaning
- * "implemented, awaiting EM prod verification + close."
+ * actionable set, and add `pr approved` — meaning "implemented and merged, awaiting
+ * the EM outcome-gate."
+ *
+ * It must NOT be `ready for prod release`: that label is the EM outcome-gate's
+ * signature and authorizes production. Granting it here would let the Foreman
+ * authorize its own release (separation of duties, 2026-07-27).
  *
  * Stripping `triggerLabel` is the load-bearing half: without it the issue stays
  * "actionable" forever and the Foreman burns a full Claude session every back-off
@@ -706,10 +710,10 @@ export function transitionToReadyForProd(
         "issue", "edit", String(num),
         "--repo", config.githubRepo,
         "--remove-label", config.triggerLabel,
-        "--add-label", "ready for prod release",
+        "--add-label", "pr approved",
       ], config.repoPath);
       logger.info(
-        `Terminal transition on #${num}: removed "${config.triggerLabel}", added "ready for prod release" (work already merged to ${config.baseBranch})`,
+        `Terminal transition on #${num}: removed "${config.triggerLabel}", added "pr approved" (work already merged to ${config.baseBranch})`,
       );
     } catch (err) {
       logger.warn(
@@ -762,7 +766,7 @@ export function findStuckMergedIssues(
     const issues: { number: number; labels: { name: string }[] }[] = JSON.parse(issueJson || "[]");
     const candidates = issues.filter(
       (i) => !i.labels.some(
-        (l) => l.name === "pr pending actions" || l.name === "ready for prod release",
+        (l) => l.name === "pr pending actions" || l.name === "pr approved" || l.name === "ready for prod release",
       ),
     );
     if (candidates.length === 0) return [];
