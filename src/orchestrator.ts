@@ -804,7 +804,9 @@ function tryPromotion(
           `Updated promotion PR #${existingPR.number} — added ${missingIssues.length} issue(s): ${missingIssues.map((i) => `#${i.number}`).join(", ")}`
         );
       } else {
-        promoLogger.warn(`Failed to update promotion PR #${existingPR.number}`);
+        promoLogger.error(
+          `Failed to update promotion PR #${existingPR.number} — ${missingIssues.length} dev-verified issue(s) are BLOCKED from production and no promotion PR reflects them. This is not cosmetic: the promote phase found the work and could not act on it.`
+        );
       }
     } else {
       promoLogger.info(`Promotion PR #${existingPR.number} already includes all ${issues.length} issue(s)`);

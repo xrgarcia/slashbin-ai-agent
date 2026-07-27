@@ -980,17 +980,36 @@ ${issueList}
 ---
 Automated by slashbin-ai-agent`;
 
+  // REST, NOT `gh pr edit` (2026-07-27).
+  //
+  // `gh pr edit` resolves the PR through GraphQL and requests `projectCards` —
+  // GitHub's Projects *classic*, now sunset. The API rejects that field, gh
+  // exits 1, and the edit DOES NOT APPLY:
+  //
+  //   GraphQL: Projects (classic) is being deprecated in favor of the new
+  //   Projects experience (repository.pullRequest.projectCards)
+  //
+  // Reproduced twice against jerky_data_receiver#241 — exit 1, title unchanged.
+  // This silently blocked EVERY repo that already had an open promotion PR,
+  // from ~04:11Z until it was found at ~21:10Z: the promote phase kept logging
+  // "Found N issue(s) ready for prod release" and then failing to act. Creating
+  // a NEW promotion PR still worked, which is why some promotions got through
+  // and others did not — a confusing signal that delayed the diagnosis.
+  //
+  // The REST endpoint touches no Projects field at all, so the deprecation
+  // cannot affect it. Do not "simplify" this back to `gh pr edit`.
+  const [owner, name] = repo.split("/");
   try {
     gh([
-      "pr", "edit", String(prNumber),
-      "--repo", repo,
-      "--title", title,
-      "--body", body,
+      "api", "--method", "PATCH",
+      `repos/${owner}/${name}/pulls/${prNumber}`,
+      "-f", `title=${title}`,
+      "-f", `body=${body}`,
+      "--silent",
     ], cwd);
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Log stderr if available from execFileSync
     const stderr = (err as { stderr?: string }).stderr ?? "";
     console.error(`updatePromotionPR failed: ${msg}${stderr ? ` | stderr: ${stderr}` : ""}`);
     return false;
