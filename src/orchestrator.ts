@@ -118,10 +118,75 @@ export interface CycleResult {
  *  `repoCycle` (this service's own pass count). */
 const repoCycleCounter = new Map<string, number>();
 
-interface RepoCycleResult {
+export interface RepoCycleResult {
   processed: number;
   lastImplementation: ImplementationResult | null;
   events: CycleEvent[];
+}
+
+/**
+ * Fleet-wide slot limiter. Each repo drives its OWN loop (see startDaemon), so
+ * nothing else bounds how many agent sessions exist at once — twenty repos
+ * waking together would be twenty concurrent Claude sessions and twenty streams
+ * of GitHub calls. Slots are held for the whole of a repo's pass and released
+ * even when the pass throws, so one crashing repo cannot leak the fleet's
+ * capacity away one slot at a time.
+ */
+let slotLimit = 3;
+let slotsInUse = 0;
+const slotWaiters: Array<() => void> = [];
+
+export function setConcurrencyLimit(limit: number): void {
+  slotLimit = Math.max(1, limit);
+  // A raised limit must wake anyone already queued, or a config reload that
+  // increases capacity would have no effect until the next natural release.
+  while (slotsInUse < slotLimit && slotWaiters.length > 0) {
+    const wake = slotWaiters.shift();
+    if (wake) {
+      slotsInUse++;
+      wake();
+    }
+  }
+}
+
+async function acquireSlot(): Promise<void> {
+  if (slotsInUse < slotLimit) {
+    slotsInUse++;
+    return;
+  }
+  await new Promise<void>((resolve) => slotWaiters.push(resolve));
+}
+
+function releaseSlot(): void {
+  const wake = slotWaiters.shift();
+  if (wake) {
+    wake(); // hand the slot straight to the next waiter; count stays put
+    return;
+  }
+  slotsInUse = Math.max(0, slotsInUse - 1);
+}
+
+/** Repos waiting for a slot right now — surfaced so a queue that stops moving
+ *  is visible rather than looking like an idle fleet. */
+export function getQueuedRepoCount(): number {
+  return slotWaiters.length;
+}
+
+/**
+ * Run one pass for one repo, holding a fleet concurrency slot for its duration.
+ * This is what a per-repo loop calls.
+ */
+export async function runRepoPass(
+  repoConfig: RepoConfig,
+  config: AgentConfig,
+  logger: Logger,
+): Promise<RepoCycleResult> {
+  await acquireSlot();
+  try {
+    return await runRepoCycle(repoConfig, config, logger, 0);
+  } finally {
+    releaseSlot();
+  }
 }
 
 /**
@@ -150,6 +215,11 @@ async function runRepoCycle(
 
   const repoCycle = (repoCycleCounter.get(repoConfig.name) ?? 0) + 1;
   repoCycleCounter.set(repoConfig.name, repoCycle);
+  // The phase helpers use the cycle number for per-repo failure cooldowns
+  // ("retry after N idle cycles"), so they must count THIS repo's passes. With
+  // independent per-repo loops a fleet-wide counter no longer maps to a repo's
+  // own turns, and a cooldown measured in someone else's cycles is arbitrary.
+  cycleNumber = repoCycle;
   const base = logger.child({ cycle: cycleNumber, repoCycle, repo: repoConfig.name });
 
   // --- Phase 0: Reconcile orphaned commits (features ahead of develop with no PR) ---
