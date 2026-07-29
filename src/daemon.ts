@@ -1,7 +1,7 @@
 import type { AgentConfig } from "./config.js";
 import { loadConfig } from "./config.js";
 import type { Logger } from "./logger.js";
-import { runCycle, getAbortController } from "./orchestrator.js";
+import { runCycle, getActiveRunCount, getActiveRunRepos, abortAllRuns } from "./orchestrator.js";
 import { BridgeClient, type BridgeConfig } from "./bridge-client.js";
 
 export interface DaemonOptions {
@@ -46,6 +46,7 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
     repos: repoNames,
     repoCount: config.repos.length,
     pollInterval: `${config.pollIntervalMs / 1000}s`,
+    maxConcurrentRepos: config.maxConcurrentRepos,
   });
 
   for (const repo of config.repos) {
@@ -172,16 +173,22 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
     const drainMs =
       Number(process.env.AI_AGENT_SHUTDOWN_DRAIN_MS) ||
       Math.max(longestRun, config.reviewMaxDurationMs);
-    const ac = getAbortController();
-    if (ac) {
-      logger.info(`Waiting for in-progress implementation to finish (${Math.round(drainMs / 1000)}s timeout)...`);
+    // Several repos can be mid-run at once now, so drain ALL of them. Waiting on
+    // a single controller would have returned as soon as the first one finished
+    // and left the rest to be SIGKILLed with half-built branches — the exact
+    // outcome TimeoutStopSec=1800 exists to prevent.
+    if (getActiveRunCount() > 0) {
+      logger.info(
+        `Waiting for ${getActiveRunCount()} in-progress run(s) to finish (${Math.round(drainMs / 1000)}s timeout)...`,
+        { repos: getActiveRunRepos() },
+      );
       const deadline = Date.now() + drainMs;
-      while (getAbortController() && Date.now() < deadline) {
+      while (getActiveRunCount() > 0 && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 1000));
       }
-      if (getAbortController()) {
-        logger.warn("Drain window elapsed — aborting in-progress implementation");
-        ac.abort();
+      if (getActiveRunCount() > 0) {
+        logger.warn("Drain window elapsed — aborting in-progress run(s)", { repos: getActiveRunRepos() });
+        abortAllRuns();
       }
     }
 

@@ -38,6 +38,13 @@ const configSchema = z.object({
 
   // Global settings
   pollIntervalMs: z.coerce.number().int().positive().default(300_000),
+  // How many repos may run their pipeline at the same time. Repos are safe to
+  // run concurrently on their own — each has its own git working clone, so two
+  // can never touch the same checkout — so this cap is about SPEND, not safety:
+  // each concurrent repo means another Claude session (up to maxTurns) and
+  // another stream of GitHub API calls. Default 3; raise it deliberately after
+  // watching what it costs. Set to 1 for the original strictly-serial behaviour.
+  maxConcurrentRepos: z.coerce.number().int().positive().default(3),
   // Base window for the escalating per-issue skip back-off. The Nth consecutive
   // skip of an issue waits skipBackoffMs * 2^(N-1), capped at SKIP_BACKOFF_MAX_MS.
   // Additive + OSS-safe: defaults to the historical fixed 30 min, so an existing
@@ -117,6 +124,8 @@ export interface RepoConfig {
 export interface AgentConfig {
   repos: readonly RepoConfig[];
   pollIntervalMs: number;
+  /** Max repos running their pipeline at once (default 3). Caps spend, not risk. */
+  maxConcurrentRepos: number;
   /** Base window for the escalating per-issue skip back-off (default 30 min). */
   skipBackoffMs: number;
   logFormat: "json" | "text";
@@ -173,6 +182,7 @@ export function loadConfig(configPath?: string): AgentConfig {
     githubRepo: process.env.AI_AGENT_GITHUB_REPO ?? fileConfig.githubRepo,
     triggerLabel: process.env.AI_AGENT_TRIGGER_LABEL ?? fileConfig.triggerLabel,
     pollIntervalMs: process.env.AI_AGENT_POLL_INTERVAL_MS ?? fileConfig.pollIntervalMs,
+    maxConcurrentRepos: process.env.AI_AGENT_MAX_CONCURRENT_REPOS ?? fileConfig.maxConcurrentRepos,
     skipBackoffMs: process.env.AI_AGENT_SKIP_BACKOFF_MS ?? fileConfig.skipBackoffMs,
     skillPath: process.env.AI_AGENT_SKILL_PATH ?? fileConfig.skillPath,
     prompt: process.env.AI_AGENT_PROMPT ?? fileConfig.prompt,
@@ -283,6 +293,7 @@ export function loadConfig(configPath?: string): AgentConfig {
   return Object.freeze({
     repos: Object.freeze(repos),
     pollIntervalMs: parsed.pollIntervalMs,
+    maxConcurrentRepos: parsed.maxConcurrentRepos,
     skipBackoffMs: parsed.skipBackoffMs,
     logFormat: parsed.logFormat,
     logLevel: parsed.logLevel,

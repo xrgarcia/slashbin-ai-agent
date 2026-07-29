@@ -33,8 +33,13 @@ import { loadRepoState, saveRepoState } from "./state.js";
 
 const MAX_RETRIES = 2;
 
-let implementing: string | null = null; // repo name, or null
-let abortController: AbortController | null = null;
+// Agent runs in flight, keyed by repo name. Repos progress CONCURRENTLY (one
+// queue per service — see runCycle), so "the" in-flight run stopped being a
+// single thing; a lone `abortController` would have tracked whichever repo
+// started last and let a restart SIGKILL every other repo's half-built branch.
+// One entry per repo, at most — a repo's own phases stay strictly sequential
+// because they share one git working clone.
+const activeRuns = new Map<string, AbortController>();
 
 // Per-repo consecutive batch failure count with cooldown
 const failureCount = new Map<string, number>();
@@ -53,6 +58,9 @@ const lastFailureReason = new Map<string, string>(); // per-repo last failure fo
 
 export interface OrchestratorState {
   implementing: string | null;
+  /** Every repo with an agent run in flight. `implementing` is the first of
+   *  these, kept for callers that predate concurrency. */
+  implementingRepos: string[];
   repos: Record<string, { failures: number; revisionFailures: number }>;
 }
 
@@ -64,11 +72,32 @@ export function getState(config: AgentConfig): OrchestratorState {
       revisionFailures: revisionFailureCount.get(repo.name) ?? 0,
     };
   }
-  return { implementing, repos };
+  const implementingRepos = [...activeRuns.keys()];
+  return { implementing: implementingRepos[0] ?? null, implementingRepos, repos };
 }
 
+/** Back-compat: a single controller for callers written before concurrency.
+ *  Prefer `getActiveRunCount()` + `abortAllRuns()` — with several repos in
+ *  flight this returns an arbitrary one, and aborting it drains nothing else. */
 export function getAbortController(): AbortController | null {
-  return abortController;
+  for (const ac of activeRuns.values()) return ac;
+  return null;
+}
+
+/** How many agent runs are in flight right now, across all repos. */
+export function getActiveRunCount(): number {
+  return activeRuns.size;
+}
+
+/** Repos currently running an agent, for shutdown logging. */
+export function getActiveRunRepos(): string[] {
+  return [...activeRuns.keys()];
+}
+
+/** Abort every in-flight run. Only for a shutdown whose drain window elapsed —
+ *  this destroys work in progress. */
+export function abortAllRuns(): void {
+  for (const ac of activeRuns.values()) ac.abort();
 }
 
 export interface CycleEvent {
@@ -82,6 +111,153 @@ export interface CycleResult {
   events: CycleEvent[];
 }
 
+/** Per-repo cycle counter. The fleet-wide `cycle=N` alone became unreadable the
+ *  moment repos ran concurrently — twenty repos interleaving under one number
+ *  gives no way to follow a single service's progress, and an unreadable log is
+ *  how a stalled queue hides. Every line now carries both: `cycle` (fleet) and
+ *  `repoCycle` (this service's own pass count). */
+const repoCycleCounter = new Map<string, number>();
+
+interface RepoCycleResult {
+  processed: number;
+  lastImplementation: ImplementationResult | null;
+  events: CycleEvent[];
+}
+
+/**
+ * One full pass over ONE repo: reconcile -> review -> revise -> implement ->
+ * sync -> promote.
+ *
+ * Phase order within a repo is load-bearing and unchanged. Review runs before
+ * implement so it only acts on PRs labeled in a PRIOR pass (a PR created by
+ * this pass waits for the next one, avoiding a same-cycle GitHub-consistency
+ * race). Promote runs last so it sees labels this pass just set.
+ *
+ * What changed is that this is now the unit of concurrency. Repos no longer
+ * queue behind each other: a 30-minute build on one service used to block the
+ * other nineteen, because the old shape was six sequential loops over all
+ * repos and every phase awaited each one in turn.
+ */
+async function runRepoCycle(
+  repoConfig: RepoConfig,
+  config: AgentConfig,
+  logger: Logger,
+  cycleNumber: number,
+): Promise<RepoCycleResult> {
+  const events: CycleEvent[] = [];
+  let processed = 0;
+  let lastImplementation: ImplementationResult | null = null;
+
+  const repoCycle = (repoCycleCounter.get(repoConfig.name) ?? 0) + 1;
+  repoCycleCounter.set(repoConfig.name, repoCycle);
+  const base = logger.child({ cycle: cycleNumber, repoCycle, repo: repoConfig.name });
+
+  // --- Phase 0: Reconcile orphaned commits (features ahead of develop with no PR) ---
+  const reconLogger = base.child({ phase: "reconcile" });
+  try {
+    const result = reconcileRepo(repoConfig, reconLogger);
+    if (result.reconciled) {
+      reconLogger.info(
+        `Reconciled ${result.commitCount} orphaned commit(s) — PR created: ${result.prUrl}`,
+        { issues: result.issueNumbers },
+      );
+      events.push({ message: `Reconciled ${repoConfig.githubRepo} — ${result.commitCount} orphaned commit(s), PR: ${result.prUrl}`, level: "info" });
+      processed++;
+    }
+  } catch (err) {
+    reconLogger.error("Reconciliation failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // Surface dead-zoned issues: PR merged to develop but the issue is still
+  // `pr under review` (post-merge verify failed and no phase recovers it).
+  // Detection only — the EM re-verifies and advances/flags by hand.
+  //
+  // ALERT ONCE per (repo, issue). The dead-zone is a STANDING condition, not an
+  // event: it persists every cycle until the EM clears it, so re-emitting each
+  // reconcile pass floods Discord with the identical line (~every 2 min) and
+  // trains the reader to ignore the channel — the alarm defeats itself.
+  // Observed 2026-07-19 on Slashbin-console#661 (Ray: "i keep seeing this
+  // messages"). The warning fires on transition INTO the dead-zone; the entry
+  // clears when the issue leaves it, so a genuine re-entry alerts again.
+  try {
+    const stuck = findStuckMergedIssues(repoConfig, reconLogger);
+    const seen = deadZoneAlerted.get(repoConfig.name) ?? new Set<number>();
+    const current = new Set(stuck.map((s) => s.issueNumber));
+    for (const s of stuck) {
+      if (seen.has(s.issueNumber)) continue; // already alerted; still stuck
+      seen.add(s.issueNumber);
+      reconLogger.warn(
+        `Dead-zoned issue #${s.issueNumber}: PR #${s.prNumber} merged to ${repoConfig.baseBranch} but issue still "pr under review" — post-merge verify never advanced it`,
+        { prUrl: s.prUrl, mergedAt: s.mergedAt },
+      );
+      events.push({
+        message: `⚠️ ${repoConfig.githubRepo} #${s.issueNumber} dead-zoned: PR #${s.prNumber} merged but issue still "pr under review". EM: re-verify (npm run verify --repo ${repoConfig.name} --pr ${s.prNumber} --env development), then advance to "ready for prod release" or flag "pr pending actions".`,
+        level: "warn",
+      });
+    }
+    // Drop cleared issues so a real re-entry alerts again.
+    for (const n of [...seen]) if (!current.has(n)) seen.delete(n);
+    deadZoneAlerted.set(repoConfig.name, seen);
+  } catch (err) {
+    reconLogger.debug(
+      `Dead-zone detection failed for ${repoConfig.name}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // --- Phase 1: Review open feature PRs (invokes the EM /review-all-prs skill) ---
+  if (await tryReview(repoConfig, config, base, cycleNumber, events)) processed++;
+
+  // --- Phase 2: Revise PRs with pending review feedback ---
+  const revisionInfo = await tryRevision(repoConfig, base, cycleNumber);
+  if (revisionInfo) {
+    events.push({ message: `Revised ${repoConfig.githubRepo} PR #${revisionInfo.pr.number} (issues: ${revisionInfo.issueNumbers.map(n => `#${n}`).join(", ")})`, level: "info" });
+    processed++;
+  }
+
+  // --- Phase 3: Implement approved issues (one batch per repo) ---
+  const implResult = await tryBatchImplementation(repoConfig, config, base, cycleNumber, events);
+  if (implResult) {
+    processed++;
+    lastImplementation = implResult;
+  }
+
+  // --- Phase 4: Reconcile branch drift (main → develop) for any repo with
+  //    post-promotion merge commits. Runs independently of promotion work so
+  //    drift is cleared even when no ready-for-prod issues exist. ---
+  if (!(repoConfig.baseBranch === "main" && repoConfig.featureBranch === "main")) {
+    if (trySyncDrift(repoConfig, base, cycleNumber)) {
+      events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged`, level: "info" });
+      processed++;
+    }
+  }
+
+  // --- Phase 5: Create promotion PRs for repos with ready-for-prod issues ---
+  const promotionResult = tryPromotion(repoConfig, base, cycleNumber);
+  if (promotionResult === "promoted") {
+    events.push({ message: `Promotion PR created on ${repoConfig.githubRepo} (develop → main)`, level: "info" });
+    processed++;
+  } else if (promotionResult === "synced") {
+    events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged, promotion will follow`, level: "info" });
+    processed++;
+  }
+
+  return { processed, lastImplementation, events };
+}
+
+/**
+ * One fleet pass: every repo runs its own pipeline, several at a time.
+ *
+ * The cap is about SPEND, not safety. Concurrent repos are safe on their own —
+ * each has its own git working clone, so two of them can never touch the same
+ * checkout, and a repo's phases stay sequential within `runRepoCycle`. What a
+ * high cap actually buys you is N simultaneous Claude sessions (each up to 100
+ * turns) and N times the GitHub API traffic, on an API that already returns
+ * intermittent TLS timeouts at one.
+ *
+ * Set `maxConcurrentRepos` in .ai-agent.json or AI_AGENT_MAX_CONCURRENT_REPOS.
+ */
 export async function runCycle(
   config: AgentConfig,
   logger: Logger,
@@ -93,117 +269,34 @@ export async function runCycle(
   let lastResult: ImplementationResult | null = null;
   const events: CycleEvent[] = [];
 
-  // --- Phase 0: Reconcile orphaned commits (features ahead of develop with no PR) ---
-  for (const repoConfig of config.repos) {
-    const reconLogger = logger.child({ cycle: cycleNumber, repo: repoConfig.name, phase: "reconcile" });
-    try {
-      const result = reconcileRepo(repoConfig, reconLogger);
-      if (result.reconciled) {
-        reconLogger.info(
-          `Reconciled ${result.commitCount} orphaned commit(s) — PR created: ${result.prUrl}`,
-          { issues: result.issueNumbers },
-        );
-        events.push({ message: `Reconciled ${repoConfig.githubRepo} — ${result.commitCount} orphaned commit(s), PR: ${result.prUrl}`, level: "info" });
-        totalProcessed++;
-      }
-    } catch (err) {
-      reconLogger.error("Reconciliation failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+  const limit = Math.max(1, Math.min(config.maxConcurrentRepos, config.repos.length));
+  const queue = [...config.repos];
 
-    // Surface dead-zoned issues: PR merged to develop but the issue is still
-    // `pr under review` (post-merge verify failed and no phase recovers it).
-    // Detection only — the EM re-verifies and advances/flags by hand.
-    //
-    // ALERT ONCE per (repo, issue). The dead-zone is a STANDING condition, not an
-    // event: it persists every cycle until the EM clears it, so re-emitting each
-    // reconcile pass floods Discord with the identical line (~every 2 min) and
-    // trains the reader to ignore the channel — the alarm defeats itself.
-    // Observed 2026-07-19 on Slashbin-console#661 (Ray: "i keep seeing this
-    // messages"). The warning fires on transition INTO the dead-zone; the entry
-    // clears when the issue leaves it, so a genuine re-entry alerts again.
-    try {
-      const stuck = findStuckMergedIssues(repoConfig, reconLogger);
-      const seen = deadZoneAlerted.get(repoConfig.name) ?? new Set<number>();
-      const current = new Set(stuck.map((s) => s.issueNumber));
-      for (const s of stuck) {
-        if (seen.has(s.issueNumber)) continue; // already alerted; still stuck
-        seen.add(s.issueNumber);
-        reconLogger.warn(
-          `Dead-zoned issue #${s.issueNumber}: PR #${s.prNumber} merged to ${repoConfig.baseBranch} but issue still "pr under review" — post-merge verify never advanced it`,
-          { prUrl: s.prUrl, mergedAt: s.mergedAt },
-        );
-        events.push({
-          message: `⚠️ ${repoConfig.githubRepo} #${s.issueNumber} dead-zoned: PR #${s.prNumber} merged but issue still "pr under review". EM: re-verify (npm run verify --repo ${repoConfig.name} --pr ${s.prNumber} --env development), then advance to "ready for prod release" or flag "pr pending actions".`,
-          level: "warn",
+  if (limit > 1) {
+    cycleLogger.debug(`Running ${config.repos.length} repo(s), up to ${limit} concurrently`);
+  }
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const repoConfig = queue.shift();
+      if (!repoConfig) return;
+      try {
+        const result = await runRepoCycle(repoConfig, config, logger, cycleNumber);
+        totalProcessed += result.processed;
+        events.push(...result.events);
+        if (result.lastImplementation) lastResult = result.lastImplementation;
+      } catch (err) {
+        // One repo's pipeline must never take the fleet pass down with it —
+        // that would be the serial failure mode reintroduced through the back
+        // door, with every other repo starved by an unrelated crash.
+        logger.child({ cycle: cycleNumber, repo: repoConfig.name }).error("Repo cycle failed", {
+          error: err instanceof Error ? err.message : String(err),
         });
       }
-      // Drop cleared issues so a real re-entry alerts again.
-      for (const n of [...seen]) if (!current.has(n)) seen.delete(n);
-      deadZoneAlerted.set(repoConfig.name, seen);
-    } catch (err) {
-      reconLogger.debug(
-        `Dead-zone detection failed for ${repoConfig.name}: ${err instanceof Error ? err.message : String(err)}`,
-      );
     }
-  }
+  };
 
-  // --- Phase 1: Review open feature PRs (invokes the EM /review-all-prs skill) ---
-  // Runs FIRST among the PR-acting phases so it only acts on PRs labeled
-  // `pr under review` in a PRIOR cycle (labels settled). PRs created by THIS
-  // cycle's implement phase wait for next cycle's review — avoids a same-cycle
-  // GitHub-consistency race. The skill owns its own label transitions and merges;
-  // its side effects (`ready for prod release` / `pr pending actions`) feed the
-  // promote and revise phases respectively.
-  for (const repoConfig of config.repos) {
-    const reviewed = await tryReview(repoConfig, config, logger, cycleNumber, events);
-    if (reviewed) {
-      totalProcessed++;
-    }
-  }
-
-  // --- Phase 2: Revise PRs with pending review feedback ---
-  for (const repoConfig of config.repos) {
-    const revisionInfo = await tryRevision(repoConfig, logger, cycleNumber);
-    if (revisionInfo) {
-      events.push({ message: `Revised ${repoConfig.githubRepo} PR #${revisionInfo.pr.number} (issues: ${revisionInfo.issueNumbers.map(n => `#${n}`).join(", ")})`, level: "info" });
-      totalProcessed++;
-    }
-  }
-
-  // --- Phase 3: Implement approved issues (one batch per repo) ---
-  for (const repoConfig of config.repos) {
-    const result = await tryBatchImplementation(repoConfig, config, logger, cycleNumber, events);
-    if (result) {
-      totalProcessed++;
-      lastResult = result;
-    }
-  }
-
-  // --- Phase 4: Reconcile branch drift (main → develop) for any repo with
-  //    post-promotion merge commits. Runs independently of promotion work so
-  //    drift is cleared even when no ready-for-prod issues exist. ---
-  for (const repoConfig of config.repos) {
-    if (repoConfig.baseBranch === "main" && repoConfig.featureBranch === "main") continue;
-    const synced = trySyncDrift(repoConfig, logger, cycleNumber);
-    if (synced) {
-      events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged`, level: "info" });
-      totalProcessed++;
-    }
-  }
-
-  // --- Phase 5: Create promotion PRs for repos with ready-for-prod issues ---
-  for (const repoConfig of config.repos) {
-    const promotionResult = tryPromotion(repoConfig, logger, cycleNumber);
-    if (promotionResult === "promoted") {
-      events.push({ message: `Promotion PR created on ${repoConfig.githubRepo} (develop → main)`, level: "info" });
-      totalProcessed++;
-    } else if (promotionResult === "synced") {
-      events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged, promotion will follow`, level: "info" });
-      totalProcessed++;
-    }
-  }
+  await Promise.all(Array.from({ length: limit }, () => worker()));
 
   if (totalProcessed === 0) {
     cycleLogger.info("No work across all repos");
@@ -416,13 +509,13 @@ async function tryBatchImplementation(
   // exists, the skill creates one. If one exists, new commits are added to it.
 
   // Invoke the skill — one Claude session implements all approved issues
-  implementing = repoName;
-  abortController = new AbortController();
+  const runAbort = new AbortController();
+  activeRuns.set(repoName, runAbort);
   repoLogger.info(`Triggering batch implementation for ${repoName}`);
 
   try {
     const priorFailure = lastFailureReason.get(repoName) || null;
-    const result = await implementApprovedIssues(repoConfig, repoLogger, abortController.signal, priorFailure, actionableIssues);
+    const result = await implementApprovedIssues(repoConfig, repoLogger, runAbort.signal, priorFailure, actionableIssues);
 
     if (result.success) {
       failureCount.set(repoName, 0);
@@ -595,8 +688,7 @@ async function tryBatchImplementation(
 
     return result;
   } finally {
-    implementing = null;
-    abortController = null;
+    activeRuns.delete(repoName);
   }
 }
 
@@ -623,13 +715,13 @@ async function tryRevision(
   }
 
   // Invoke the revision skill with specific PR and issue context
-  implementing = repoName;
-  abortController = new AbortController();
+  const runAbort = new AbortController();
+  activeRuns.set(repoName, runAbort);
   revLogger.info(`Triggering PR revision for ${repoName} — PR #${pending.pr.number}, issues: ${pending.issueNumbers.map(n => `#${n}`).join(", ")}`);
 
   try {
     const result = await revisePRFeedback(
-      repoConfig, revLogger, abortController.signal,
+      repoConfig, revLogger, runAbort.signal,
       pending.pr.number, pending.issueNumbers,
     );
 
@@ -656,8 +748,7 @@ async function tryRevision(
 
     return null;
   } finally {
-    implementing = null;
-    abortController = null;
+    activeRuns.delete(repoName);
   }
 }
 
@@ -708,13 +799,13 @@ async function tryReview(
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const transcriptPath = resolve(process.cwd(), "logs", "review", `${repoName}-cycle${cycleNumber}-${ts}.log`);
 
-  implementing = repoName;
-  abortController = new AbortController();
+  const runAbort = new AbortController();
+  activeRuns.set(repoName, runAbort);
   reviewLogger.info(`Triggering review for ${repoName} — PR #${candidate.prNumber} (issues: ${candidate.issueNumbers.map(n => `#${n}`).join(", ")}), transcript: ${transcriptPath}`);
   events?.push({ message: `Reviewing ${repoConfig.githubRepo} PR #${candidate.prNumber} (issues: ${candidate.issueNumbers.map(n => `#${n}`).join(", ")})`, level: "info" });
 
   try {
-    const result = await reviewOpenPRs(repoConfig, config, reviewLogger, abortController.signal, transcriptPath);
+    const result = await reviewOpenPRs(repoConfig, config, reviewLogger, runAbort.signal, transcriptPath);
 
     if (result.success) {
       reviewFailureCount.set(repoName, 0);
@@ -737,8 +828,7 @@ async function tryReview(
     events?.push({ message: `Review failed on ${repoConfig.githubRepo} PR #${candidate.prNumber}: ${result.error}`, level: "error" });
     return false;
   } finally {
-    implementing = null;
-    abortController = null;
+    activeRuns.delete(repoName);
   }
 }
 
