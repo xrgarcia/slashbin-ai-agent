@@ -17,6 +17,7 @@ import {
   checkBranchDrift,
   findOpenSyncPR,
   createSyncPR,
+  tryMergeSyncPR,
   countBranchDiffFiles,
   stripReadyForProdLabel,
   type PendingRevisionInfo,
@@ -912,16 +913,29 @@ function trySyncDrift(
   const drift = checkBranchDrift(repoConfig.githubRepo, repoConfig.repoPath, syncLogger);
   if (!drift || drift.developBehindMain === 0) return false;
 
+  // An already-open sync PR is a RETRY, not a no-op. The merge attempted at
+  // creation runs while required checks are still IN_PROGRESS and is refused, so
+  // "already open" is the normal state a few seconds later — and returning early
+  // here meant it was never merged at all. `develop` then stays behind `main`,
+  // the next promotion PR goes BEHIND, and branch protection refuses it.
+  // (Slashbin-console#779: open 2h48m over ~140 no-op cycles, blocking #782.)
   const existing = findOpenSyncPR(repoConfig.githubRepo, repoConfig.repoPath, syncLogger);
   if (existing) {
-    syncLogger.info(`Sync PR already open — #${existing.number}: ${existing.url}`);
+    if (tryMergeSyncPR(repoConfig.githubRepo, existing.number, repoConfig.repoPath, syncLogger)) {
+      syncLogger.info(`Sync PR merged on retry — #${existing.number}: ${existing.url}`);
+      return true;
+    }
+    syncLogger.info(`Sync PR open, not yet mergeable — #${existing.number}: ${existing.url}`);
     return false;
   }
 
   syncLogger.info(`develop is ${drift.developBehindMain} commit(s) behind main — creating sync PR`);
   const syncUrl = createSyncPR(repoConfig.githubRepo, drift.developBehindMain, repoConfig.repoPath, syncLogger);
   if (syncUrl) {
-    syncLogger.info(`Sync PR created and auto-merged: ${syncUrl}`);
+    // Say what actually happened. This line used to assert "created and
+    // auto-merged" unconditionally, which was false whenever branch protection
+    // refused the create-time merge — i.e. on every protected repo.
+    syncLogger.info(`Sync PR created — ${syncUrl} (merge retried each cycle until checks pass)`);
     return true;
   }
   syncLogger.warn("Failed to create sync PR");

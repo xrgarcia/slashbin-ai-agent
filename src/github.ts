@@ -1424,15 +1424,73 @@ export function createSyncPR(
 
       logger?.info(`Sync PR #${prNumber} created and merged immediately`);
     } catch (mergeErr) {
-      // If merge fails (status checks, conflicts), log but don't crash.
-      // The PR still exists for manual merge.
-      logger?.warn(`Sync PR #${prNumber} created but auto-merge failed: ${mergeErr instanceof Error ? mergeErr.message : String(mergeErr)}`);
+      // Expected on any repo with required status checks: the merge is attempted
+      // seconds after creation, while build/test/typecheck are still IN_PROGRESS,
+      // so branch protection refuses it. Not fatal — `tryMergeSyncPR` retries on a
+      // later cycle once the checks land. See its comment for why that retry is
+      // load-bearing rather than cosmetic.
+      logger?.warn(`Sync PR #${prNumber} created but immediate auto-merge failed (will retry next cycle): ${mergeErr instanceof Error ? mergeErr.message : String(mergeErr)}`);
     }
 
     return prUrl;
   } catch (err) {
     logger?.warn("createSyncPR: gh pr create failed", { ...formatGhError(err), repo, behindBy });
     return null;
+  }
+}
+
+/**
+ * Merge an already-open sync PR. Returns true only if it is merged afterwards.
+ *
+ * WHY THIS EXISTS (2026-07-30). `createSyncPR` approves and merges the instant it
+ * creates the PR — seconds later, while required status checks are still
+ * IN_PROGRESS. On any repo with branch protection that merge is refused. The old
+ * code caught that, said "the PR still exists for manual merge", and moved on;
+ * the caller then logged "Sync PR created and auto-merged" regardless, and on
+ * every later cycle logged "Sync PR already open" and returned early WITHOUT ever
+ * retrying. So the merge never happened, the log claimed it had, and the sync PR
+ * stayed open forever.
+ *
+ * That is not cosmetic. `develop` stays behind `main`, which makes the next
+ * promotion PR `BEHIND`, which branch protection refuses to merge. Observed on
+ * `Slashbin-console#779`: open 2h48m across ~140 no-op cycles, blocking the
+ * promotion of #782 until it was merged by hand. The same "created and
+ * auto-merged" line had already been logged for #438, #559 and #783.
+ *
+ * Idempotent by construction: re-approving an approved PR and merging a merged
+ * PR are both no-ops we treat as success, so retrying every cycle is safe.
+ */
+export function tryMergeSyncPR(
+  repo: string,
+  prNumber: number,
+  cwd: string,
+  logger?: Logger,
+): boolean {
+  try {
+    // Re-approve defensively: on the retry path the original approval is already
+    // there, and gh treats a repeat approval as a no-op.
+    try {
+      ghAsEM([
+        "pr", "review", String(prNumber),
+        "--repo", repo,
+        "--approve",
+        "--body", "Automated sync — approved by EM.",
+      ], cwd);
+    } catch {
+      // Already approved, or approval not required. Not a reason to skip the merge.
+    }
+
+    ghAsEM([
+      "pr", "merge", String(prNumber),
+      "--repo", repo,
+      "--merge",
+    ], cwd);
+    return true;
+  } catch (err) {
+    // Still blocked (checks pending, conflict, protection). Report at debug so a
+    // normal cycle isn't noisy — the caller reports the durable state.
+    logger?.debug(`Sync PR #${prNumber} not mergeable yet: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
   }
 }
 
