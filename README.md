@@ -115,6 +115,8 @@ For a single repo, set fields at the root level:
 | `githubRepo` | `AI_AGENT_GITHUB_REPO` | *(from git remote)* | GitHub `owner/repo` |
 | `triggerLabel` | `AI_AGENT_TRIGGER_LABEL` | `approved` | Label that triggers implementation |
 | `pollIntervalMs` | `AI_AGENT_POLL_INTERVAL_MS` | `300000` (5 min) | Poll interval in milliseconds |
+| `issueCacheTtlMs` | `AI_AGENT_ISSUE_CACHE_TTL_MS` | `30000` (30 s) | How long a repo's open-issue snapshot stays warm. Keep it **below** `pollIntervalMs`. `0` disables caching. See [GitHub API budget](#github-api-budget) |
+| `issueSnapshotLimit` | `AI_AGENT_ISSUE_SNAPSHOT_LIMIT` | `500` | Max open issues fetched per snapshot. Must exceed a repo's open-issue count; truncation is logged |
 | `skillPath` | `AI_AGENT_SKILL_PATH` | — | Claude Code skill for implementation |
 | `revisionSkillPath` | — | — | Claude Code skill for PR revision |
 | `prompt` | `AI_AGENT_PROMPT` | *(built-in)* | Custom prompt template |
@@ -125,6 +127,23 @@ For a single repo, set fields at the root level:
 | `allowedTools` | — | `["Read","Write","Edit","Bash","Glob","Grep"]` | Tools the CLI can use |
 | `logFormat` | `AI_AGENT_LOG_FORMAT` | `text` | `json` or `text` |
 | `logLevel` | `AI_AGENT_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+
+### GitHub API budget
+
+Each poll cycle spends **one GraphQL request per repo** for issue discovery. GitHub's GraphQL limit is **5,000 requests/hour per token**, so the discovery floor is:
+
+```
+repos × (3600000 / pollIntervalMs)   requests/hour
+```
+
+The daemon logs this as `estDiscoveryGraphQlPerHour` on startup — check it against 5,000 after adding repos or lowering the poll interval. 20 repos at a 60 s interval is 1,200/hour; the same 20 repos would need an interval under ~15 s before discovery alone threatened the ceiling. Merges, reviews, and promotions spend additional requests on top, but only when there is work.
+
+This budget is why the discovery phases share **one open-issue snapshot per repo per cycle** rather than issuing a query per label. Before that change, six lookups each ran their own `gh issue list` — 20 repos on a 60 s interval came to ~7,200 requests/hour, which permanently exhausted the token and made roughly one lookup in six fail. A failed lookup silently skips that phase for that repo that cycle, so `approved` issues sat unimplemented with nothing but generic errors in the log.
+
+Two consequences worth knowing:
+
+- **Keep `issueCacheTtlMs` below `pollIntervalMs`**, or a cycle can be served entirely from the previous cycle's snapshot and an externally-applied `approved` label waits an extra cycle. The daemon warns at startup if you cross that line.
+- **Rate-limit rejections are logged as `[gh] RATE LIMIT EXHAUSTED`** and are deliberately not retried — the budget is already spent. If you see them, raise `pollIntervalMs` or reduce the repo count.
 
 ### Multi-repo mode
 
