@@ -163,6 +163,7 @@ export function configureIssueCache(opts: { ttlMs?: number; snapshotLimit?: numb
     issueSnapshotLimit = Math.floor(opts.snapshotLimit);
   }
   issueSnapshots.clear();
+  prSnapshots.clear();
 }
 
 /**
@@ -171,11 +172,33 @@ export function configureIssueCache(opts: { ttlMs?: number; snapshotLimit?: numb
  * `list`/`view` are reads and left alone.
  */
 function invalidateSnapshotIfMutating(args: string[]): void {
-  if (args[0] !== "issue") return;
-  if (args[1] === "list" || args[1] === "view") return;
-  const i = args.indexOf("--repo");
-  const repo = i >= 0 ? args[i + 1] : undefined;
-  if (repo) issueSnapshots.delete(repo);
+  const repoIdx = args.indexOf("--repo");
+  const repo = repoIdx >= 0 ? args[repoIdx + 1] : undefined;
+
+  // `gh api --method POST/PATCH/PUT/DELETE` can label, merge, or retarget
+  // anything, and the URL shape varies too much to attribute reliably. Clear
+  // everything — conservative, and a cache miss only costs one request.
+  const methodIdx = args.indexOf("--method");
+  if (args[0] === "api" && methodIdx >= 0 && args[methodIdx + 1] !== "GET") {
+    issueSnapshots.clear();
+    prSnapshots.clear();
+    return;
+  }
+
+  if (!repo) return;
+
+  // Read-only subcommands leave state alone; everything else may change it.
+  const READ_ONLY = new Set(["list", "view", "diff", "checks", "status"]);
+  if (READ_ONLY.has(args[1])) return;
+
+  if (args[0] === "issue") issueSnapshots.delete(repo);
+  // A PR merge closes the PR *and* moves the issue labels that track it, so a
+  // `pr` mutation has to drop both — otherwise a later phase this cycle reads a
+  // merged PR back as open.
+  if (args[0] === "pr") {
+    prSnapshots.delete(repo);
+    issueSnapshots.delete(repo);
+  }
 }
 
 /** Every open issue in the repo, from cache when warm. */
@@ -210,6 +233,73 @@ function getOpenIssues(repo: string, cwd: string, logger: Logger): IssueSnapshot
 /** True when `issue` carries a label named `name`. */
 function hasLabel(issue: IssueSnapshot, name: string): boolean {
   return issue.labels.some((l) => l.name === name);
+}
+
+/**
+ * The same collapse for OPEN pull requests, and for the same reason.
+ *
+ * Roughly three `gh pr list --state open` calls run per repo per cycle no matter
+ * whether there is any work — the reconcile phase's sync-PR check
+ * (`develop ← main`), the promote phase's open-promotion-PR check
+ * (`main ← develop`), and the review phase's orphan-adoption probe, which runs
+ * precisely when there is nothing to review, i.e. most cycles. Each spends a
+ * GraphQL request. At 20 repos on a 60s interval that is ~3,600/hour on its own,
+ * and it is why collapsing the issue lookups alone left the token at 5,279/hour
+ * against a 5,000 ceiling — measured, after that first fix.
+ *
+ * Every one of those calls is a `--head`/`--base` slice of "open PRs in this
+ * repo", so they share one snapshot and filter in memory.
+ *
+ * Deliberately NOT served from here: `--state merged` queries (a different set)
+ * and the one call that needs `files` (a per-PR file list, far heavier than the
+ * scalar fields below). Those stay live.
+ */
+interface PrSnapshot {
+  number: number;
+  url: string;
+  title: string;
+  body: string;
+  headRefName: string;
+  baseRefName: string;
+}
+
+const prSnapshots = new Map<string, { fetchedAt: number; prs: PrSnapshot[] }>();
+
+/** Every open PR in the repo, from cache when warm. */
+function getOpenPrs(repo: string, cwd: string): PrSnapshot[] {
+  const cached = prSnapshots.get(repo);
+  if (cached && issueCacheTtlMs > 0 && Date.now() - cached.fetchedAt < issueCacheTtlMs) {
+    return cached.prs;
+  }
+
+  const json = gh([
+    "pr", "list",
+    "--repo", repo,
+    "--state", "open",
+    "--json", "number,url,title,body,headRefName,baseRefName",
+    "--limit", "100",
+  ], cwd);
+  const prs: PrSnapshot[] = JSON.parse(json || "[]");
+
+  if (issueCacheTtlMs > 0) prSnapshots.set(repo, { fetchedAt: Date.now(), prs });
+  return prs;
+}
+
+/**
+ * Open PRs matching a head/base pair, newest first — the shape the old
+ * `--head X --base Y --limit N` calls returned.
+ */
+function findOpenPrs(
+  repo: string,
+  cwd: string,
+  opts: { head?: string; base?: string; limit?: number },
+): PrSnapshot[] {
+  const matches = getOpenPrs(repo, cwd).filter(
+    (p) =>
+      (opts.head === undefined || p.headRefName === opts.head) &&
+      (opts.base === undefined || p.baseRefName === opts.base),
+  );
+  return opts.limit === undefined ? matches : matches.slice(0, opts.limit);
 }
 
 /**
@@ -391,14 +481,7 @@ export function findActionableIssues(
     // that references them. If so, skip — the Foreman already did the work.
     // Check both open and merged PRs to catch issues where the PR was already merged
     // but the issue label wasn't updated.
-    const openPrJson = gh([
-      "pr", "list",
-      "--repo", repo,
-      "--state", "open",
-      "--base", config.baseBranch,
-      "--json", "number,title,body",
-      "--limit", "50",
-    ], config.repoPath);
+    const openPrs = findOpenPrs(repo, config.repoPath, { base: config.baseBranch, limit: 50 });
 
     const mergedPrJson = gh([
       "pr", "list",
@@ -409,7 +492,6 @@ export function findActionableIssues(
       "--limit", "20",
     ], config.repoPath);
 
-    const openPrs: { number: number; title: string; body: string }[] = JSON.parse(openPrJson || "[]");
     const mergedPrs: { number: number; title: string; body: string }[] = JSON.parse(mergedPrJson || "[]");
     const allPrs = [...openPrs, ...mergedPrs];
 
@@ -500,17 +582,11 @@ export function findPendingRevisions(
     if (issues.length === 0) return null;
 
     // Confirm there's an open feature PR (features → develop)
-    const prJson = gh([
-      "pr", "list",
-      "--repo", config.githubRepo,
-      "--state", "open",
-      "--head", config.featureBranch,
-      "--base", config.baseBranch,
-      "--json", "number,url,headRefName",
-      "--limit", "1",
-    ], config.repoPath);
-
-    const prs: PendingRevisionPR[] = JSON.parse(prJson || "[]");
+    const prs: PendingRevisionPR[] = findOpenPrs(config.githubRepo, config.repoPath, {
+      head: config.featureBranch,
+      base: config.baseBranch,
+      limit: 1,
+    });
     if (prs.length > 0) {
       logger.info(`Found ${issues.length} issue(s) pending revision with open PR #${prs[0].number}: ${issues.map(i => `#${i.number}`).join(", ")}`);
       return { issueNumbers: issues.map(i => i.number), pr: prs[0] };
@@ -578,17 +654,11 @@ export function findPRsNeedingReview(
     }
 
     // Confirm an open feature PR exists (features → develop).
-    const prJson = gh([
-      "pr", "list",
-      "--repo", config.githubRepo,
-      "--state", "open",
-      "--head", config.featureBranch,
-      "--base", config.baseBranch,
-      "--json", "number,url",
-      "--limit", "1",
-    ], config.repoPath);
-
-    const prs: { number: number; url: string }[] = JSON.parse(prJson || "[]");
+    const prs: { number: number; url: string }[] = findOpenPrs(config.githubRepo, config.repoPath, {
+      head: config.featureBranch,
+      base: config.baseBranch,
+      limit: 1,
+    });
     if (prs.length === 0) {
       logger.debug(`${config.name}: ${reviewable.length} issue(s) labeled "pr under review" but no open feature PR`);
       return null;
@@ -631,17 +701,11 @@ function adoptOrphanedReviewCandidate(
   reviewerLogin: string,
   logger: Logger,
 ): ReviewCandidate | null {
-  const prJson = gh([
-    "pr", "list",
-    "--repo", config.githubRepo,
-    "--state", "open",
-    "--head", config.featureBranch,
-    "--base", config.baseBranch,
-    "--json", "number,url,title,body",
-    "--limit", "1",
-  ], config.repoPath);
-
-  const prs: { number: number; url: string; title: string; body: string }[] = JSON.parse(prJson || "[]");
+  const prs: { number: number; url: string; title: string; body: string }[] = findOpenPrs(
+    config.githubRepo,
+    config.repoPath,
+    { head: config.featureBranch, base: config.baseBranch, limit: 1 },
+  );
   if (prs.length === 0) return null;
   const pr = prs[0];
 
@@ -864,16 +928,12 @@ export function findStuckMergedIssues(
     if (candidates.length === 0) return [];
 
     // An OPEN feature PR means these are normal review-pending — tryReview owns them.
-    const openJson = gh([
-      "pr", "list",
-      "--repo", config.githubRepo,
-      "--state", "open",
-      "--head", config.featureBranch,
-      "--base", config.baseBranch,
-      "--json", "number",
-      "--limit", "1",
-    ], config.repoPath);
-    if ((JSON.parse(openJson || "[]") as unknown[]).length > 0) return [];
+    const openFeaturePrs = findOpenPrs(config.githubRepo, config.repoPath, {
+      head: config.featureBranch,
+      base: config.baseBranch,
+      limit: 1,
+    });
+    if (openFeaturePrs.length > 0) return [];
 
     // Resolve merged work via the SHARED strict primitive — not a bare `#N` scan.
     // A bare-`#N` match would false-positive on an incidental prose mention
@@ -1025,17 +1085,7 @@ export function findOpenPromotionPR(
   logger?: Logger,
 ): OpenPromotionPR | null {
   try {
-    const json = gh([
-      "pr", "list",
-      "--repo", repo,
-      "--state", "open",
-      "--base", baseBranch,
-      "--head", "develop",
-      "--json", "number,url,body",
-      "--limit", "1",
-    ], cwd);
-
-    const prs: OpenPromotionPR[] = JSON.parse(json || "[]");
+    const prs: OpenPromotionPR[] = findOpenPrs(repo, cwd, { base: baseBranch, head: "develop", limit: 1 });
     return prs.length > 0 ? prs[0] : null;
   } catch (err) {
     logger?.warn("findOpenPromotionPR: gh pr list failed", { ...formatGhError(err) });
@@ -1313,17 +1363,7 @@ export function findOpenSyncPR(
   logger?: Logger,
 ): OpenPromotionPR | null {
   try {
-    const json = gh([
-      "pr", "list",
-      "--repo", repo,
-      "--state", "open",
-      "--base", "develop",
-      "--head", "main",
-      "--json", "number,url",
-      "--limit", "1",
-    ], cwd);
-
-    const prs: OpenPromotionPR[] = JSON.parse(json || "[]");
+    const prs: OpenPromotionPR[] = findOpenPrs(repo, cwd, { base: "develop", head: "main", limit: 1 });
     return prs.length > 0 ? prs[0] : null;
   } catch (err) {
     logger?.warn("findOpenSyncPR: gh pr list failed", { ...formatGhError(err) });
@@ -1406,16 +1446,7 @@ export function verifyPRExists(
   logger?: Logger,
 ): boolean {
   try {
-    const json = gh([
-      "pr", "list",
-      "--repo", repo,
-      "--head", headBranch,
-      "--base", baseBranch,
-      "--state", "open",
-      "--json", "number",
-      "--limit", "1",
-    ], cwd);
-    const prs = JSON.parse(json || "[]");
+    const prs = findOpenPrs(repo, cwd, { head: headBranch, base: baseBranch, limit: 1 });
     return prs.length > 0;
   } catch (err) {
     logger?.warn("verifyPRExists: gh pr list failed", { ...formatGhError(err), repo, headBranch, baseBranch });
