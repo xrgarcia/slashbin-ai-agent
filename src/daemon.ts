@@ -3,6 +3,7 @@ import { loadConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { runRepoPass, setConcurrencyLimit, getActiveRunCount, getActiveRunRepos, getQueuedRepoCount, abortAllRuns } from "./orchestrator.js";
 import { BridgeClient, type BridgeConfig } from "./bridge-client.js";
+import { configureIssueCache } from "./github.js";
 
 export interface DaemonOptions {
   configPath?: string;
@@ -41,12 +42,35 @@ export function startDaemon(config: AgentConfig, logger: Logger, options?: Daemo
     logger.debug("Discord bridge disabled — DISCORD_BOT_ID and DISCORD_STATUS_CHANNEL not set");
   }
 
+  // One open-issue snapshot per repo per cycle, instead of one GraphQL request
+  // per discovery lookup. See the block comment above `getOpenIssues`.
+  configureIssueCache({
+    ttlMs: config.issueCacheTtlMs,
+    snapshotLimit: config.issueSnapshotLimit,
+  });
+
+  // A TTL at or above the poll interval means a cycle can be served entirely
+  // from the previous cycle's snapshot, so an externally-applied `approved`
+  // waits an extra cycle. Legal, but almost never intended — say so.
+  if (config.issueCacheTtlMs >= config.pollIntervalMs) {
+    logger.warn(
+      "issueCacheTtlMs >= pollIntervalMs — a cycle may reuse the previous cycle's issue snapshot, delaying pickup of externally-applied labels by one cycle",
+      { issueCacheTtlMs: config.issueCacheTtlMs, pollIntervalMs: config.pollIntervalMs },
+    );
+  }
+
   const repoNames = config.repos.map((r) => r.name).join(", ");
   logger.info("Daemon starting", {
     repos: repoNames,
     repoCount: config.repos.length,
     pollInterval: `${config.pollIntervalMs / 1000}s`,
     maxConcurrentRepos: config.maxConcurrentRepos,
+    issueCacheTtlMs: config.issueCacheTtlMs,
+    // Requests/hour the discovery phases will now spend, so the budget is
+    // visible in the log rather than something you have to rediscover.
+    estDiscoveryGraphQlPerHour: Math.round(
+      config.repos.length * (3600_000 / config.pollIntervalMs),
+    ),
   });
 
   for (const repo of config.repos) {

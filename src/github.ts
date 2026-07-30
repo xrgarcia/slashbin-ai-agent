@@ -2,14 +2,6 @@ import { execFileSync } from "node:child_process";
 import type { RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 
-interface GhIssue {
-  number: number;
-  title: string;
-  body: string;
-  labels: { name: string }[];
-  url: string;
-}
-
 const GH_MAX_ATTEMPTS = 3;
 const GH_BACKOFF_MS = [1000, 3000, 9000];
 
@@ -40,6 +32,28 @@ function isTransientGhError(err: unknown): boolean {
   );
 }
 
+/**
+ * A rate-limit rejection is NOT transient — retrying it inside the same cycle
+ * only spends more of an already-exhausted budget. It gets its own classifier
+ * for one reason: so it is *nameable* in the log.
+ *
+ * 2026-07-30: the daemon emitted 22,466 of these in 24 hours (~1,100/hour,
+ * unbroken for 21+ hours) and every one surfaced as a generic
+ * "Failed to check for approved issues" — the same line a real outage prints.
+ * A quota problem that is indistinguishable from a dead Foreman is a
+ * diagnosability defect on top of the quota defect, so we label it explicitly.
+ */
+function isRateLimitGhError(err: unknown): boolean {
+  const { message, stderr } = formatGhError(err);
+  const blob = `${message}\n${stderr}`.toLowerCase();
+  return (
+    blob.includes("api rate limit already exceeded") ||
+    blob.includes("api rate limit exceeded") ||
+    blob.includes("secondary rate limit") ||
+    blob.includes("was submitted too quickly")
+  );
+}
+
 /** execFileSync gh with retry+backoff on transient (network/5xx/timeout) failures. */
 function runGh(args: string[], cwd: string, token: string): string {
   let lastErr: unknown;
@@ -54,6 +68,12 @@ function runGh(args: string[], cwd: string, token: string): string {
       }).trim();
     } catch (err) {
       lastErr = err;
+      if (isRateLimitGhError(err)) {
+        // Deliberately not retried: the budget is already gone. Name it loudly
+        // and once, then let the caller's own error path handle the cycle.
+        console.warn(`[gh] RATE LIMIT EXHAUSTED — GitHub API quota is spent, skipping: gh ${args.slice(0, 3).join(" ")}`);
+        throw err;
+      }
       if (attempt < GH_MAX_ATTEMPTS && isTransientGhError(err)) {
         const wait = GH_BACKOFF_MS[attempt - 1];
         const { message, stderr } = formatGhError(err);
@@ -71,6 +91,7 @@ function runGh(args: string[], cwd: string, token: string): string {
 export function gh(args: string[], cwd: string): string {
   const foremanToken = process.env.FOREMAN_GITHUB_TOKEN;
   if (!foremanToken) throw new Error("FOREMAN_GITHUB_TOKEN not set — cannot operate as Foreman");
+  invalidateSnapshotIfMutating(args);
   return runGh(args, cwd, foremanToken);
 }
 
@@ -78,7 +99,117 @@ export function gh(args: string[], cwd: string): string {
 function ghAsEM(args: string[], cwd: string): string {
   const emToken = process.env.EM_GITHUB_TOKEN;
   if (!emToken) throw new Error("EM_GITHUB_TOKEN not set — cannot approve/merge as EM");
+  invalidateSnapshotIfMutating(args);
   return runGh(args, cwd, emToken);
+}
+
+// ---------------------------------------------------------------------------
+// Open-issue snapshot: one `gh issue list` per repo per cycle
+// ---------------------------------------------------------------------------
+
+/**
+ * The six discovery lookups in this file (`approved` ×2, `pr under review` ×2,
+ * `pr pending actions`, `ready for prod release`) each used to issue their own
+ * `gh issue list --state open` against the SAME repo. Every `gh issue list`
+ * spends a GraphQL request, and GraphQL is capped at 5,000/hour per token.
+ *
+ * 2026-07-30: 20 repos × ~6 lookups × a 60s poll interval ≈ 7,200 GraphQL
+ * calls/hour against that 5,000 ceiling. The Foreman token sat permanently
+ * exhausted — 22,466 rejections in 24 hours — so roughly one lookup in six
+ * failed outright. A failed lookup silently skips that phase for that repo
+ * that cycle: an `approved` issue goes unimplemented, a
+ * `ready for prod release` unpromoted, recovering only on a later cycle that
+ * happens to win the quota race.
+ *
+ * The fix is that all six lookups are label subsets of ONE query. We fetch
+ * `--state open` once per repo, cache it briefly, and filter in memory:
+ * 6 calls → 1 (≈1,200/hour, comfortably inside budget) with the poll interval
+ * left where operations wants it at 60s. Fetching every open issue instead of
+ * a label-filtered slice costs no extra requests — the request count is driven
+ * by pages, not by predicates.
+ *
+ * Correctness: the snapshot is dropped whenever the Foreman mutates an issue in
+ * that repo (see `invalidateSnapshotIfMutating`), so a label written by an
+ * earlier phase is never read back stale later in the same cycle. A label
+ * changed EXTERNALLY — the EM applying `approved` — is picked up on the next
+ * refresh, i.e. at worst one TTL late, which is a delay the poll interval
+ * already implies.
+ *
+ * Additive and OSS-safe: `issueCacheTtlMs: 0` restores the old behaviour of one
+ * live query per lookup.
+ */
+interface IssueSnapshot {
+  number: number;
+  title: string;
+  labels: { name: string }[];
+}
+
+const DEFAULT_ISSUE_CACHE_TTL_MS = 30_000;
+const DEFAULT_ISSUE_SNAPSHOT_LIMIT = 500;
+
+let issueCacheTtlMs = DEFAULT_ISSUE_CACHE_TTL_MS;
+let issueSnapshotLimit = DEFAULT_ISSUE_SNAPSHOT_LIMIT;
+const issueSnapshots = new Map<string, { fetchedAt: number; issues: IssueSnapshot[] }>();
+
+/**
+ * Apply daemon-level cache settings. Called once at startup; defaults stand if
+ * it is never called, so nothing downstream has to know this exists.
+ */
+export function configureIssueCache(opts: { ttlMs?: number; snapshotLimit?: number }): void {
+  if (typeof opts.ttlMs === "number" && Number.isFinite(opts.ttlMs) && opts.ttlMs >= 0) {
+    issueCacheTtlMs = opts.ttlMs;
+  }
+  if (typeof opts.snapshotLimit === "number" && Number.isFinite(opts.snapshotLimit) && opts.snapshotLimit > 0) {
+    issueSnapshotLimit = Math.floor(opts.snapshotLimit);
+  }
+  issueSnapshots.clear();
+}
+
+/**
+ * Drop a repo's cached snapshot when a command mutates issue state, so a later
+ * phase re-reads what this cycle just wrote. Keyed off the `--repo` argument;
+ * `list`/`view` are reads and left alone.
+ */
+function invalidateSnapshotIfMutating(args: string[]): void {
+  if (args[0] !== "issue") return;
+  if (args[1] === "list" || args[1] === "view") return;
+  const i = args.indexOf("--repo");
+  const repo = i >= 0 ? args[i + 1] : undefined;
+  if (repo) issueSnapshots.delete(repo);
+}
+
+/** Every open issue in the repo, from cache when warm. */
+function getOpenIssues(repo: string, cwd: string, logger: Logger): IssueSnapshot[] {
+  const cached = issueSnapshots.get(repo);
+  if (cached && issueCacheTtlMs > 0 && Date.now() - cached.fetchedAt < issueCacheTtlMs) {
+    return cached.issues;
+  }
+
+  const json = gh([
+    "issue", "list",
+    "--repo", repo,
+    "--state", "open",
+    "--json", "number,title,labels",
+    "--limit", String(issueSnapshotLimit),
+  ], cwd);
+  const issues: IssueSnapshot[] = JSON.parse(json || "[]");
+
+  // No silent caps. Hitting the limit means discovery may be blind to issues it
+  // is supposed to see, which would look exactly like "no work to do".
+  if (issues.length >= issueSnapshotLimit) {
+    logger.warn(
+      "Open-issue snapshot hit its limit — discovery may be missing issues; raise issueSnapshotLimit",
+      { repo, limit: issueSnapshotLimit, returned: issues.length },
+    );
+  }
+
+  if (issueCacheTtlMs > 0) issueSnapshots.set(repo, { fetchedAt: Date.now(), issues });
+  return issues;
+}
+
+/** True when `issue` carries a label named `name`. */
+function hasLabel(issue: IssueSnapshot, name: string): boolean {
+  return issue.labels.some((l) => l.name === name);
 }
 
 /**
@@ -133,15 +264,8 @@ export function findAllApprovedActionableIssues(
 ): number[] {
   const repo = config.githubRepo;
   try {
-    const json = gh([
-      "issue", "list",
-      "--repo", repo,
-      "--state", "open",
-      "--label", config.triggerLabel,
-      "--json", "number,labels",
-      "--limit", "100",
-    ], config.repoPath);
-    const issues: GhIssue[] = JSON.parse(json || "[]");
+    const issues = getOpenIssues(repo, config.repoPath, logger)
+      .filter((i) => hasLabel(i, config.triggerLabel));
 
     const lifecycleLabels = [
       "pr under review",
@@ -241,16 +365,8 @@ export function findActionableIssues(
   const repo = config.githubRepo;
 
   try {
-    const json = gh([
-      "issue", "list",
-      "--repo", repo,
-      "--state", "open",
-      "--label", config.triggerLabel,
-      "--json", "number,labels",
-      "--limit", "100",
-    ], config.repoPath);
-
-    const issues: GhIssue[] = JSON.parse(json || "[]");
+    const issues = getOpenIssues(repo, config.repoPath, logger)
+      .filter((i) => hasLabel(i, config.triggerLabel));
 
     const lifecycleLabels = [
       "pr under review",
@@ -379,17 +495,8 @@ export function findPendingRevisions(
 ): PendingRevisionInfo | null {
   try {
     // Find issues labeled "pr pending actions" + the trigger label (approved)
-    const issueJson = gh([
-      "issue", "list",
-      "--repo", config.githubRepo,
-      "--state", "open",
-      "--label", "pr pending actions",
-      "--label", config.triggerLabel,
-      "--json", "number,title",
-      "--limit", "100",
-    ], config.repoPath);
-
-    const issues: { number: number; title: string }[] = JSON.parse(issueJson || "[]");
+    const issues = getOpenIssues(config.githubRepo, config.repoPath, logger)
+      .filter((i) => hasLabel(i, "pr pending actions") && hasLabel(i, config.triggerLabel));
     if (issues.length === 0) return null;
 
     // Confirm there's an open feature PR (features → develop)
@@ -462,18 +569,10 @@ export function findPRsNeedingReview(
   logger: Logger,
 ): ReviewCandidate | null {
   try {
-    const issueJson = gh([
-      "issue", "list",
-      "--repo", config.githubRepo,
-      "--state", "open",
-      "--label", "pr under review",
-      "--json", "number,labels",
-      "--limit", "100",
-    ], config.repoPath);
-
-    const issues: { number: number; labels: { name: string }[] }[] = JSON.parse(issueJson || "[]");
+    const issues = getOpenIssues(config.githubRepo, config.repoPath, logger)
+      .filter((i) => hasLabel(i, "pr under review"));
     // Exclude issues also labeled `pr pending actions` — the revise phase owns those.
-    const reviewable = issues.filter((i) => !i.labels.some((l) => l.name === "pr pending actions"));
+    const reviewable = issues.filter((i) => !hasLabel(i, "pr pending actions"));
     if (reviewable.length === 0) {
       return adoptOrphanedReviewCandidate(config, reviewerLogin, logger);
     }
@@ -755,18 +854,11 @@ export function findStuckMergedIssues(
 ): StuckMergedIssue[] {
   if (config.baseBranch === config.featureBranch) return [];
   try {
-    const issueJson = gh([
-      "issue", "list",
-      "--repo", config.githubRepo,
-      "--state", "open",
-      "--label", "pr under review",
-      "--json", "number,labels",
-      "--limit", "100",
-    ], config.repoPath);
-    const issues: { number: number; labels: { name: string }[] }[] = JSON.parse(issueJson || "[]");
+    const issues = getOpenIssues(config.githubRepo, config.repoPath, logger)
+      .filter((i) => hasLabel(i, "pr under review"));
     const candidates = issues.filter(
-      (i) => !i.labels.some(
-        (l) => l.name === "pr pending actions" || l.name === "pr approved" || l.name === "ready for prod release",
+      (i) => !(
+        hasLabel(i, "pr pending actions") || hasLabel(i, "pr approved") || hasLabel(i, "ready for prod release")
       ),
     );
     if (candidates.length === 0) return [];
@@ -909,16 +1001,9 @@ export function findReadyForProdIssues(
   logger: Logger
 ): PromotionIssue[] {
   try {
-    const json = gh([
-      "issue", "list",
-      "--repo", repo,
-      "--state", "open",
-      "--label", "ready for prod release",
-      "--json", "number,title",
-      "--limit", "100",
-    ], cwd);
-
-    return JSON.parse(json || "[]");
+    return getOpenIssues(repo, cwd, logger)
+      .filter((i) => hasLabel(i, "ready for prod release"))
+      .map((i) => ({ number: i.number, title: i.title }));
   } catch (err) {
     logger.error("Failed to query ready-for-prod issues", {
       error: err instanceof Error ? err.message : String(err),

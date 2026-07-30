@@ -51,6 +51,19 @@ const configSchema = z.object({
   // .ai-agent.json keeps working with no new key (the first window is unchanged;
   // only repeat skips of the SAME issue back off further). slashbin-ai-foreman#32.
   skipBackoffMs: z.coerce.number().int().positive().default(1_800_000),
+  // How long a repo's open-issue snapshot stays warm. The discovery phases each
+  // used to run their own `gh issue list` against the same repo — six GraphQL
+  // requests per repo per cycle, which at 20 repos on a 60s poll blew GitHub's
+  // 5,000/hour GraphQL ceiling and left the token permanently exhausted. One
+  // snapshot per repo per cycle serves all six. Must stay BELOW pollIntervalMs
+  // so each cycle sees fresh data; the default is half the shipped 60s floor.
+  // Set to 0 to disable caching and restore one live query per lookup.
+  // Additive + OSS-safe: an existing .ai-agent.json needs no new key.
+  issueCacheTtlMs: z.coerce.number().int().nonnegative().default(30_000),
+  // Page cap for that snapshot. It must exceed a repo's OPEN issue count, which
+  // is larger than any single label slice the old per-label queries fetched —
+  // hence 500 rather than the previous 100. Truncation is logged, never silent.
+  issueSnapshotLimit: z.coerce.number().int().positive().default(500),
   maxTurns: z.coerce.number().int().positive().default(30),
   maxDurationMs: z.coerce.number().int().positive().default(1_800_000),
   allowedTools: z.array(z.string()).default(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
@@ -128,6 +141,10 @@ export interface AgentConfig {
   maxConcurrentRepos: number;
   /** Base window for the escalating per-issue skip back-off (default 30 min). */
   skipBackoffMs: number;
+  /** How long a repo's open-issue snapshot stays warm (default 30s; 0 disables). */
+  issueCacheTtlMs: number;
+  /** Page cap for the open-issue snapshot (default 500). */
+  issueSnapshotLimit: number;
   logFormat: "json" | "text";
   logLevel: "debug" | "info" | "warn" | "error";
 
@@ -184,6 +201,8 @@ export function loadConfig(configPath?: string): AgentConfig {
     pollIntervalMs: process.env.AI_AGENT_POLL_INTERVAL_MS ?? fileConfig.pollIntervalMs,
     maxConcurrentRepos: process.env.AI_AGENT_MAX_CONCURRENT_REPOS ?? fileConfig.maxConcurrentRepos,
     skipBackoffMs: process.env.AI_AGENT_SKIP_BACKOFF_MS ?? fileConfig.skipBackoffMs,
+    issueCacheTtlMs: process.env.AI_AGENT_ISSUE_CACHE_TTL_MS ?? fileConfig.issueCacheTtlMs,
+    issueSnapshotLimit: process.env.AI_AGENT_ISSUE_SNAPSHOT_LIMIT ?? fileConfig.issueSnapshotLimit,
     skillPath: process.env.AI_AGENT_SKILL_PATH ?? fileConfig.skillPath,
     prompt: process.env.AI_AGENT_PROMPT ?? fileConfig.prompt,
     baseBranch: process.env.AI_AGENT_BASE_BRANCH ?? fileConfig.baseBranch,
@@ -295,6 +314,8 @@ export function loadConfig(configPath?: string): AgentConfig {
     pollIntervalMs: parsed.pollIntervalMs,
     maxConcurrentRepos: parsed.maxConcurrentRepos,
     skipBackoffMs: parsed.skipBackoffMs,
+    issueCacheTtlMs: parsed.issueCacheTtlMs,
+    issueSnapshotLimit: parsed.issueSnapshotLimit,
     logFormat: parsed.logFormat,
     logLevel: parsed.logLevel,
     emRepoPath,
