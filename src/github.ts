@@ -201,6 +201,19 @@ function invalidateSnapshotIfMutating(args: string[]): void {
   }
 }
 
+/**
+ * Force the next `getOpenIssues(repo)` to hit the network.
+ *
+ * `invalidateSnapshotIfMutating` only sees the Foreman's OWN `gh` calls. The
+ * review phase runs in a SEPARATE Claude process, so every label it writes is
+ * invisible to this cache — read back inside the TTL, an issue the review just
+ * advanced still looks like it never moved. Any check that reads labels a
+ * foreign process may have just written must drop the snapshot first.
+ */
+export function dropIssueSnapshot(repo: string): void {
+  issueSnapshots.delete(repo);
+}
+
 /** Every open issue in the repo, from cache when warm. */
 function getOpenIssues(repo: string, cwd: string, logger: Logger): IssueSnapshot[] {
   const cached = issueSnapshots.get(repo);
@@ -901,15 +914,21 @@ const STUCK_MERGE_GRACE_MS = 15 * 60 * 1000;
  * pinned at `pr under review` with NO phase that ever recovers it. This surfaces
  * those so the EM can re-verify and advance/flag by hand.
  *
- * DETECTION ONLY — never mutates labels. Auto-advancing on a re-verify would risk
- * rubber-stamping a genuine regression (a post-merge FAIL is supposed to HOLD);
- * the safe recovery is to make the stuck state visible, not invisible.
+ * DETECTION ONLY — this function never mutates labels. It does NOT follow that
+ * nothing can be done: re-running the post-merge verification and advancing on
+ * PASS / flagging on FAIL is exactly what the alert asks the EM to do by hand,
+ * and it is not a rubber stamp because the verdict comes from the verifier, not
+ * from the agent that dropped the ball. That repair lives in the orchestrator
+ * (`recoverDeadZonedIssue`); the split keeps "what is broken" separable from
+ * "what we did about it". What remains forbidden is advancing WITHOUT a fresh
+ * verification — a post-merge FAIL must still HOLD.
  *
  * Conservative by design (returns [] on any ambiguity):
  *  - skips main-only repos (no features→develop lifecycle)
  *  - ignores issues also labeled `pr pending actions` (revise owns) or
  *    `ready for prod release` (already advanced)
- *  - ignores repos with an OPEN feature PR (normal review-pending; tryReview owns it)
+ *  - ignores issues REFERENCED BY an open feature PR (normal review-pending;
+ *    tryReview owns those specific issues)
  *  - only flags PRs merged more than STUCK_MERGE_GRACE_MS ago (no flap on fresh merges)
  */
 export function findStuckMergedIssues(
@@ -927,20 +946,50 @@ export function findStuckMergedIssues(
     );
     if (candidates.length === 0) return [];
 
-    // An OPEN feature PR means these are normal review-pending — tryReview owns them.
+    // An open feature PR means the issues THAT PR COVERS are normal
+    // review-pending — tryReview owns those. It says nothing about any other
+    // issue in the repo.
+    //
+    // This used to `return []` for the whole repo the moment any feature PR was
+    // open. Because the feature branch is long-lived and shared, a repo with
+    // active work almost always has one — so a single open PR concealed every
+    // dead-zoned issue behind it, and the dead zone became least visible exactly
+    // when the repo was busiest. Scope the exclusion to the referenced issues.
+    //
+    // Fail CLOSED on an unreadable reference list: if we cannot tell which
+    // issues the open PR covers, suppress the whole repo as before rather than
+    // risk "recovering" an issue whose PR is still open and under review.
     const openFeaturePrs = findOpenPrs(config.githubRepo, config.repoPath, {
       head: config.featureBranch,
       base: config.baseBranch,
       limit: 1,
     });
-    if (openFeaturePrs.length > 0) return [];
+    let reviewPending: number[] = [];
+    if (openFeaturePrs.length > 0) {
+      const referenced = getReferencedIssuesFromOpenPR(
+        config.githubRepo,
+        config.featureBranch,
+        config.baseBranch,
+        config.repoPath,
+        logger,
+      );
+      if (referenced === null) {
+        logger.debug(
+          `${config.name}: open feature PR present but its referenced issues are unreadable — suppressing dead-zone detection this pass`,
+        );
+        return [];
+      }
+      reviewPending = referenced;
+    }
+    const unowned = candidates.filter((i) => !reviewPending.includes(i.number));
+    if (unowned.length === 0) return [];
 
     // Resolve merged work via the SHARED strict primitive — not a bare `#N` scan.
     // A bare-`#N` match would false-positive on an incidental prose mention
     // (slashbin-ai-foreman#28), flagging issues that were never actually merged.
     const merged = findIssuesMergedToBase(
       config,
-      candidates.map((i) => i.number),
+      unowned.map((i) => i.number),
       logger,
     );
 
@@ -953,6 +1002,86 @@ export function findStuckMergedIssues(
       `findStuckMergedIssues failed for ${config.name}: ${err instanceof Error ? err.message : String(err)}`,
     );
     return [];
+  }
+}
+
+/**
+ * POST-CONDITION CHECK for a finished review run: of `issueNumbers`, which are
+ * still pinned at `pr under review` with no lifecycle label beyond it?
+ *
+ * The review phase reports its own outcome via a self-declared status trailer.
+ * A trailer is a CLAIM; the labels are the STATE. When the two disagree the
+ * labels win, because the next phase reads labels and nothing ever reads the
+ * trailer again. Checking them directly is what makes the orphan detectable
+ * without any cooperation from the agent that created it.
+ *
+ * Reads FRESH — the review runs in a separate process whose label writes never
+ * invalidate our snapshot cache, so a cached read here would report the
+ * pre-review state and manufacture a false orphan on every successful run.
+ *
+ * Returns [] on any lookup failure: a check that cannot see the truth must not
+ * assert one.
+ */
+export function findIssuesStillUnderReview(
+  config: RepoConfig,
+  issueNumbers: number[],
+  logger: Logger,
+): number[] {
+  if (issueNumbers.length === 0) return [];
+  try {
+    dropIssueSnapshot(config.githubRepo);
+    const open = getOpenIssues(config.githubRepo, config.repoPath, logger);
+    return issueNumbers.filter((num) => {
+      const issue = open.find((i) => i.number === num);
+      // Absent from the open set = closed. The review closed it out; not stuck.
+      if (!issue) return false;
+      if (!hasLabel(issue, "pr under review")) return false;
+      return !(
+        hasLabel(issue, "pr approved") ||
+        hasLabel(issue, "pr pending actions") ||
+        hasLabel(issue, "ready for prod release")
+      );
+    });
+  } catch (err) {
+    logger.debug(
+      `findIssuesStillUnderReview failed for ${config.name}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
+/**
+ * Move a dead-zoned issue out of `pr under review` once a FRESH verification has
+ * produced a verdict: `pr approved` on PASS, `pr pending actions` on FAIL.
+ *
+ * Deliberately never applies `ready for prod release` — that label is the EM
+ * outcome-gate's signature and stays a human act (separation of duties, same
+ * rule the review prompt enforces). The most this can do is restore the issue to
+ * the state a healthy review run would have left it in.
+ */
+export function resolveDeadZone(
+  config: RepoConfig,
+  issueNumber: number,
+  verdict: "pass" | "fail",
+  logger: Logger,
+): boolean {
+  const nextLabel = verdict === "pass" ? "pr approved" : "pr pending actions";
+  try {
+    gh([
+      "issue", "edit", String(issueNumber),
+      "--repo", config.githubRepo,
+      "--remove-label", "pr under review",
+      "--add-label", nextLabel,
+    ], config.repoPath);
+    logger.info(
+      `Dead-zone resolved on #${issueNumber}: removed "pr under review", added "${nextLabel}" (re-verification ${verdict.toUpperCase()})`,
+    );
+    return true;
+  } catch (err) {
+    logger.warn(
+      `Failed to resolve dead zone on #${issueNumber}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
   }
 }
 

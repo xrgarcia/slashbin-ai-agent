@@ -10,6 +10,14 @@ export interface RevisionResult {
   error?: string;
 }
 
+/** One parsed FOREMAN_REVIEW trailer line. */
+export interface ReviewTrailer {
+  pr: number;
+  verdict: string;
+  merged: boolean;
+  deploy: string;
+}
+
 export interface ReviewResult {
   success: boolean;
   error?: string;
@@ -19,31 +27,56 @@ export interface ReviewResult {
   // deployment outcome — e.g. "#100 APPROVE · merged · deploy SUCCESS". Surfaced
   // in the Foreman's Discord status line. Undefined if no trailer was emitted.
   statusLine?: string;
+  // The same trailers, structured, so the orchestrator can check the run's
+  // post-condition (did the issues it claims to have merged actually advance?).
+  trailers?: ReviewTrailer[];
 }
 
 /**
  * Parse the structured review trailers the skill is asked to emit, one per PR it
  * acted on:
  *   FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS
- * Returns a concise human-readable line, or undefined when no trailer is present.
  */
-function parseReviewTrailers(stdout: string): string | undefined {
+function parseReviewTrailerRecords(stdout: string): ReviewTrailer[] {
   // Each field uses a bounded token alphabet ([\w/-]+) so it cannot bleed into
   // surrounding characters when the trailer is emitted inside a single-line
   // stream-JSON envelope (the Claude CLI's --output-format=stream-json), where
   // the characters immediately after the trailer (`"}],"STOP_REASON":NULL,…`)
   // are non-whitespace and would be greedily absorbed by an unbounded `\S+`.
   const re = /FOREMAN_REVIEW\s+pr=#?(\d+)\s+verdict=([\w/-]+)\s+merged=([\w/-]+)\s+deploy=([\w/-]+)/gi;
-  const parts: string[] = [];
+  const out: ReviewTrailer[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(stdout)) !== null) {
     const [, pr, verdict, merged, deploy] = m;
-    const mergedTxt = /^y(es)?|true$/i.test(merged) ? "merged" : "not merged";
-    const deployTxt = /^(na|n\/a|none)$/i.test(deploy) ? "no deploy" : `deploy ${deploy.toUpperCase()}`;
-    parts.push(`#${pr} ${verdict.toUpperCase()} · ${mergedTxt} · ${deployTxt}`);
+    out.push({
+      pr: Number(pr),
+      verdict: verdict.toUpperCase(),
+      merged: /^(y|yes|true)$/i.test(merged),
+      deploy: deploy.toUpperCase(),
+    });
   }
-  return parts.length > 0 ? parts.join("; ") : undefined;
+  return out;
 }
+
+/** Render parsed trailers as the concise Discord status line. */
+function formatReviewTrailers(trailers: ReviewTrailer[]): string | undefined {
+  if (trailers.length === 0) return undefined;
+  return trailers
+    .map((t) => {
+      const mergedTxt = t.merged ? "merged" : "not merged";
+      const deployTxt = /^(NA|N\/A|NONE)$/.test(t.deploy) ? "no deploy" : `deploy ${t.deploy}`;
+      return `#${t.pr} ${t.verdict} · ${mergedTxt} · ${deployTxt}`;
+    })
+    .join("; ");
+}
+
+/**
+ * The explicit "there was nothing to review" sentinel. Without it, a clean no-op
+ * and a session that died mid-review are the same observation — no trailer — and
+ * the trailer gate below would have to choose which one to assume. Making the
+ * no-op DECLARE itself lets the gate treat silence as the failure it usually is.
+ */
+const REVIEW_NOOP_SENTINEL = /FOREMAN_REVIEW\s+none\b/i;
 
 export interface ImplementationResult {
   success: boolean;
@@ -599,13 +632,23 @@ Follow the skill exactly and act autonomously — do NOT ask questions or wait f
 - For BLOCKED PRs: post REQUEST_CHANGES, label the linked issue \`pr pending actions\`, and file S3/S4 follow-up issues per the skill.
 - Update issue labels yourself exactly as the skill specifies — the orchestrator will NOT relabel after you.
 
-If there are no open feature PRs awaiting review for this repo, that is a clean no-op — say so and stop.
+CRITICAL — THIS IS A HEADLESS SESSION. THERE IS NO NEXT TURN.
+Ending your turn ends the process. Anything still running is killed at that instant, and everything you had not done yet never happens.
+
+- NEVER end your turn to "wait" for something. There is nothing to wait with. Do not say "I'll wait for X to land", "let me check back", or "proceeding once this completes" — those sentences are how a merged PR gets left with a mislabeled issue forever.
+- Run post-merge verification IN THE FOREGROUND and block on it. Do NOT launch it as a background task and yield — a backgrounded verify is killed the moment you stop, so its result never arrives and the labeling step after it never runs.
+- The merge is irreversible and the labeling is not automatic. Once you merge a PR you MUST, in the same turn, finish verification and set the issue's labels. If you cannot finish, say so explicitly in your final message rather than stopping quietly.
+- If a step genuinely cannot complete (verification times out, a deploy never settles), do NOT stall — record the outcome, label the issue \`pr pending actions\`, and emit the trailer with \`deploy=FAILURE\`. A reported failure is recoverable; silence is not.
+
+If there are no open feature PRs awaiting review for this repo, that is a clean no-op — say so and emit exactly \`FOREMAN_REVIEW none\` as your final line.
 
 IMPORTANT — status trailer: After you finish, end your output with one line per PR you acted on, in EXACTLY this format (nothing after the last one):
 
 FOREMAN_REVIEW pr=#<number> verdict=<APPROVE|REQUEST_CHANGES> merged=<yes|no> deploy=<SUCCESS|FAILURE|NA>
 
 Rules for the trailer: \`merged=yes\` only if you actually merged the PR to the base branch. \`deploy=SUCCESS\`/\`deploy=FAILURE\` reflects the post-merge deployment+verification result for that merge (use \`deploy=NA\` when nothing was merged, or when the repo has no deployment to verify, e.g. a docs/CLI/npm-package repo). Emit one trailer line for every PR you reviewed this run.
+
+The trailer is MANDATORY and is the last thing you emit. A run that ends without either a \`FOREMAN_REVIEW pr=…\` line or \`FOREMAN_REVIEW none\` is recorded as a FAILED review regardless of how much work you did, because from the outside it is indistinguishable from a session that died mid-merge.
 
 ${IMAGE_HANDLING_INSTRUCTIONS}`;
 
@@ -638,7 +681,54 @@ ${IMAGE_HANDLING_INSTRUCTIONS}`;
   }
 
   const summary = extractStreamResult(result.stdout);
-  const statusLine = parseReviewTrailers(result.stdout);
+
+  // Read the VERDICT out of the agent's final result text, not raw stdout.
+  // `result.stdout` is the stream-json transcript, and it opens with the prompt
+  // we just sent — which quotes the trailer format and the no-op sentinel
+  // verbatim. Scanning stdout for the sentinel therefore matches OUR OWN
+  // INSTRUCTIONS on every single run, silently declaring every dead session a
+  // clean no-op and disabling the gate below completely.
+  //
+  // The trailer regex survives stdout because the prompt's example is literally
+  // `pr=#<number>` and the pattern demands `\d+` — but that is a coincidence of
+  // the placeholder, not a guarantee. Prefer the result text; fall back to
+  // stdout only when no result event was emitted at all.
+  const trailers = parseReviewTrailerRecords(summary ?? result.stdout);
+  const declaredNoOp = summary ? REVIEW_NOOP_SENTINEL.test(summary) : false;
+  const statusLine = formatReviewTrailers(trailers);
+
+  // --- Trailer gate ------------------------------------------------------
+  // A clean exit says the PROCESS ended tidily. It says nothing about whether
+  // the REVIEW finished, and the two diverge in the one case that costs us: the
+  // agent merges the PR, then ends its turn before labeling. The session exits
+  // 0, we recorded success, reset the failure counter, and moved on — while the
+  // issue sat pinned at `pr under review` with its PR already merged, invisible
+  // to every phase (`findPRsNeedingReview` only matches OPEN PRs).
+  //
+  // Measured 2026-08-03 before this gate existed: 15 of 234 review runs (6.4%)
+  // emitted no trailer, 9 of them exiting 0 — i.e. silently booked as wins.
+  // slashbin-io-worker#564 is the worked example: merged PR #565 at 02:07Z,
+  // backgrounded its verification, ended its turn with "I'll wait for the
+  // verification run to land", and the harness killed the background tasks and
+  // exited 0.
+  //
+  // So: no trailer and no explicit no-op sentinel = FAILED, whatever the exit
+  // code claimed. This does not by itself repair anything — the merge already
+  // happened — but it converts a silent orphan into a logged, alerted failure,
+  // and the dead-zone recovery in the orchestrator takes it from there.
+  if (trailers.length === 0 && !declaredNoOp) {
+    logger.error(
+      `Review for ${repoConfig.name} exited 0 but emitted no FOREMAN_REVIEW trailer — outcome unknown; treating as FAILED${transcriptPath ? ` (transcript ${transcriptPath})` : ""}`,
+    );
+    return {
+      success: false,
+      error:
+        "no FOREMAN_REVIEW trailer emitted — the review session ended without declaring an outcome (likely stopped mid-run after merging); check the issue labels",
+      summary,
+      trailers,
+    };
+  }
+
   if (summary) {
     logger.info(`Review completed for ${repoConfig.name}:\n${summary}`);
   } else {
@@ -646,6 +736,8 @@ ${IMAGE_HANDLING_INSTRUCTIONS}`;
   }
   if (statusLine) {
     logger.info(`Review outcome for ${repoConfig.name}: ${statusLine}`);
+  } else {
+    logger.info(`Review for ${repoConfig.name}: clean no-op (no PRs awaiting review)`);
   }
-  return { success: true, summary, statusLine };
+  return { success: true, summary, statusLine, trailers };
 }
