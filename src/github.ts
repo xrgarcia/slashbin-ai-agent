@@ -590,8 +590,28 @@ export function findPendingRevisions(
 ): PendingRevisionInfo | null {
   try {
     // Find issues labeled "pr pending actions" + the trigger label (approved)
-    const issues = getOpenIssues(config.githubRepo, config.repoPath, logger)
-      .filter((i) => hasLabel(i, "pr pending actions") && hasLabel(i, config.triggerLabel));
+    const pendingActions = getOpenIssues(config.githubRepo, config.repoPath, logger)
+      .filter((i) => hasLabel(i, "pr pending actions"));
+    const issues = pendingActions.filter((i) => hasLabel(i, config.triggerLabel));
+
+    // An issue asked to revise but no longer carrying the trigger label is
+    // SKIPPED here, and that is deliberate — revoking `approved` is how work is
+    // called off, and revise must honour it rather than press on.
+    //
+    // But silent is wrong. The issue keeps `pr pending actions`, so
+    // `findActionableIssues` skips it too, and it belongs to no phase at all.
+    // Deliberately stopped and accidentally stranded produced the identical
+    // observation — nothing — until this line existed. Say which one it is.
+    const withheld = pendingActions.filter((i) => !hasLabel(i, config.triggerLabel));
+    if (withheld.length > 0) {
+      logger.warn(
+        `${config.name}: ${withheld.length} issue(s) labeled "pr pending actions" without "${config.triggerLabel}" — ` +
+        `revise will NOT act on them and no other phase owns them. Intentional if the work was called off; ` +
+        `otherwise re-apply "${config.triggerLabel}" or clear the lifecycle label: ` +
+        withheld.map((i) => `#${i.number}`).join(", "),
+      );
+    }
+
     if (issues.length === 0) return null;
 
     // Confirm there's an open feature PR (features → develop)
@@ -925,11 +945,17 @@ const STUCK_MERGE_GRACE_MS = 15 * 60 * 1000;
  *
  * Conservative by design (returns [] on any ambiguity):
  *  - skips main-only repos (no features→develop lifecycle)
- *  - ignores issues also labeled `pr pending actions` (revise owns) or
- *    `ready for prod release` (already advanced)
+ *  - ignores `pr approved` / `ready for prod release` (already advanced)
  *  - ignores issues REFERENCED BY an open feature PR (normal review-pending;
  *    tryReview owns those specific issues)
  *  - only flags PRs merged more than STUCK_MERGE_GRACE_MS ago (no flap on fresh merges)
+ *
+ * `pr pending actions` USED to be excluded here on the grounds that "revise owns
+ * it". That was only true while a feature PR is open: `findPendingRevisions`
+ * returns null the moment there is none, at `debug` level, so a revision request
+ * whose PR merged or closed underneath it was owned by nobody and logged
+ * nowhere. It is the same dead zone as `pr under review`, one label over, and it
+ * is now included.
  */
 export function findStuckMergedIssues(
   config: RepoConfig,
@@ -938,10 +964,10 @@ export function findStuckMergedIssues(
   if (config.baseBranch === config.featureBranch) return [];
   try {
     const issues = getOpenIssues(config.githubRepo, config.repoPath, logger)
-      .filter((i) => hasLabel(i, "pr under review"));
+      .filter((i) => hasLabel(i, "pr under review") || hasLabel(i, "pr pending actions"));
     const candidates = issues.filter(
       (i) => !(
-        hasLabel(i, "pr pending actions") || hasLabel(i, "pr approved") || hasLabel(i, "ready for prod release")
+        hasLabel(i, "pr approved") || hasLabel(i, "ready for prod release")
       ),
     );
     if (candidates.length === 0) return [];
@@ -1002,6 +1028,127 @@ export function findStuckMergedIssues(
       `findStuckMergedIssues failed for ${config.name}: ${err instanceof Error ? err.message : String(err)}`,
     );
     return [];
+  }
+}
+
+/**
+ * Detect issues ORPHANED by work that never landed: labeled `pr under review`
+ * or `pr pending actions`, with **no open feature PR covering them and nothing
+ * merged to the base branch**. The PR was closed without merging, or the
+ * implement run recorded a label and then died before opening one.
+ *
+ * This is the third dead zone and the only one where the work does not exist:
+ *
+ *   | label               | PR open   | PR merged        | PR closed / none |
+ *   |---------------------|-----------|------------------|------------------|
+ *   | pr under review     | tryReview | findStuckMerged  | HERE             |
+ *   | pr pending actions  | tryRevise | findStuckMerged  | HERE             |
+ *
+ * The lifecycle label is what makes it invisible: `findActionableIssues` skips
+ * ANY issue carrying one, so an issue whose PR vanished keeps its `approved`
+ * label, is never re-implemented, is never reviewed, and produces no log line
+ * above `debug`. It simply stops existing as far as the pipeline is concerned.
+ *
+ * Recovery is the opposite of the merged case: there is nothing to verify, so
+ * the correct action is to RETURN IT TO THE QUEUE — strip the lifecycle label
+ * and let the implement phase pick it up again on its `approved` label. That is
+ * safe precisely because nothing merged; re-implementing cannot duplicate work
+ * that does not exist.
+ *
+ * Conservative by design:
+ *  - skips main-only repos
+ *  - ignores `pr approved` / `ready for prod release` (past this stage)
+ *  - ignores issues an open feature PR references, and fails CLOSED when that
+ *    reference list is unreadable
+ *  - requires the issue to have been in this state longer than the grace window,
+ *    so a PR being opened right now is never mistaken for one that never was
+ */
+export function findOrphanedLifecycleIssues(
+  config: RepoConfig,
+  logger: Logger,
+): number[] {
+  if (config.baseBranch === config.featureBranch) return [];
+  try {
+    const open = getOpenIssues(config.githubRepo, config.repoPath, logger);
+    const candidates = open.filter(
+      (i) =>
+        (hasLabel(i, "pr under review") || hasLabel(i, "pr pending actions")) &&
+        !hasLabel(i, "pr approved") &&
+        !hasLabel(i, "ready for prod release"),
+    );
+    if (candidates.length === 0) return [];
+
+    const openFeaturePrs = findOpenPrs(config.githubRepo, config.repoPath, {
+      head: config.featureBranch,
+      base: config.baseBranch,
+      limit: 1,
+    });
+    let reviewPending: number[] = [];
+    if (openFeaturePrs.length > 0) {
+      const referenced = getReferencedIssuesFromOpenPR(
+        config.githubRepo,
+        config.featureBranch,
+        config.baseBranch,
+        config.repoPath,
+        logger,
+      );
+      // Unreadable reference list — cannot tell what the open PR covers, so
+      // releasing anything risks re-implementing work that is in flight.
+      if (referenced === null) return [];
+      reviewPending = referenced;
+    }
+
+    const unowned = candidates.filter((i) => !reviewPending.includes(i.number));
+    if (unowned.length === 0) return [];
+
+    // Anything already merged belongs to findStuckMergedIssues, which re-verifies
+    // rather than re-queues. Only what NEVER landed is an orphan.
+    const merged = new Set(
+      findIssuesMergedToBase(config, unowned.map((i) => i.number), logger).map((m) => m.issueNumber),
+    );
+
+    return unowned.filter((i) => !merged.has(i.number)).map((i) => i.number);
+  } catch (err) {
+    logger.debug(
+      `findOrphanedLifecycleIssues failed for ${config.name}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
+/**
+ * Return an orphaned issue to the implement queue by stripping whichever
+ * lifecycle label is stranding it. The trigger label (`approved`) is left alone
+ * — it is still authorized, it just never got built.
+ */
+export function releaseOrphanedLifecycle(
+  config: RepoConfig,
+  issueNumber: number,
+  logger: Logger,
+): boolean {
+  try {
+    dropIssueSnapshot(config.githubRepo);
+    const issue = getOpenIssues(config.githubRepo, config.repoPath, logger)
+      .find((i) => i.number === issueNumber);
+    if (!issue) return false;
+
+    const args = ["issue", "edit", String(issueNumber), "--repo", config.githubRepo];
+    // `gh` errors when removing a label that is not present, so only remove what is.
+    if (hasLabel(issue, "pr under review")) args.push("--remove-label", "pr under review");
+    if (hasLabel(issue, "pr pending actions")) args.push("--remove-label", "pr pending actions");
+    if (args.length === 5) return false; // nothing to strip — state changed under us
+
+    gh(args, config.repoPath);
+    logger.warn(
+      `Released orphaned issue #${issueNumber} back to the implement queue — it carried a lifecycle label ` +
+      `but no open PR covers it and nothing merged, so the work never landed.`,
+    );
+    return true;
+  } catch (err) {
+    logger.warn(
+      `Failed to release orphaned issue #${issueNumber}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
   }
 }
 
@@ -1247,14 +1394,39 @@ export function resolveDeadZone(
 ): boolean {
   const nextLabel = verdict === "pass" ? "pr approved" : "pr pending actions";
   try {
-    gh([
-      "issue", "edit", String(issueNumber),
-      "--repo", config.githubRepo,
-      "--remove-label", "pr under review",
-      "--add-label", nextLabel,
-    ], config.repoPath);
+    // Remove only what is actually present. `gh` errors on removing an absent
+    // label, and since the dead zone now covers `pr pending actions` as well as
+    // `pr under review`, a hard `--remove-label "pr under review"` would throw
+    // on exactly the issues the widened detector just started catching — the
+    // recovery would fail for the new case while looking like a gh outage.
+    dropIssueSnapshot(config.githubRepo);
+    const issue = getOpenIssues(config.githubRepo, config.repoPath, logger)
+      .find((i) => i.number === issueNumber);
+    if (!issue) {
+      logger.debug(`Dead-zone resolve skipped for #${issueNumber} — no longer open`);
+      return false;
+    }
+
+    const args = ["issue", "edit", String(issueNumber), "--repo", config.githubRepo];
+    const stripped: string[] = [];
+    for (const l of ["pr under review", "pr pending actions"]) {
+      // Never strip the label we are about to add — that is a no-op edit that
+      // reads as a transition.
+      if (l !== nextLabel && hasLabel(issue, l)) {
+        args.push("--remove-label", l);
+        stripped.push(l);
+      }
+    }
+    if (!hasLabel(issue, nextLabel)) args.push("--add-label", nextLabel);
+    if (args.length === 4) {
+      logger.debug(`Dead-zone resolve on #${issueNumber} is already in the target state`);
+      return false;
+    }
+
+    gh(args, config.repoPath);
     logger.info(
-      `Dead-zone resolved on #${issueNumber}: removed "pr under review", added "${nextLabel}" (re-verification ${verdict.toUpperCase()})`,
+      `Dead-zone resolved on #${issueNumber}: removed ${stripped.map((s) => `"${s}"`).join(", ") || "(nothing)"}, ` +
+      `added "${nextLabel}" (re-verification ${verdict.toUpperCase()})`,
     );
     return true;
   } catch (err) {

@@ -35,6 +35,8 @@ import {
   transitionReviewOutcomeLabel,
   snapshotEmGate,
   restoreEmGate,
+  findOrphanedLifecycleIssues,
+  releaseOrphanedLifecycle,
   EM_GATE_LABEL,
 } from "./github.js";
 import type { ReviewTrailer } from "./agent.js";
@@ -538,6 +540,31 @@ async function runRepoCycle(
     for (const n of [...tried]) if (!current.has(n)) tried.delete(n);
     deadZoneAlerted.set(repoConfig.name, seen);
     deadZoneRecoveryAttempted.set(repoConfig.name, tried);
+
+    // --- Third dead zone: a lifecycle label whose work NEVER LANDED ----------
+    // `pr under review` / `pr pending actions` with no open PR covering the
+    // issue AND nothing merged. The PR was closed unmerged, or an implement run
+    // wrote the label and died before opening one.
+    //
+    // This is the invisible one. `findActionableIssues` skips any issue carrying
+    // a lifecycle label, `tryReview` needs an open PR, `findPendingRevisions`
+    // needs an open PR and returns null at DEBUG level when there is none — so
+    // the issue keeps its `approved` label, is owned by no phase, and produces
+    // no log line anybody reads. It stops existing as far as the pipeline is
+    // concerned, with nothing to indicate it ever stopped.
+    //
+    // Recovery is the inverse of the merged case: nothing exists to verify, so
+    // return it to the queue. Safe precisely BECAUSE nothing merged —
+    // re-implementing cannot duplicate work that was never done.
+    for (const num of findOrphanedLifecycleIssues(repoConfig, reconLogger)) {
+      if (releaseOrphanedLifecycle(repoConfig, num, reconLogger)) {
+        events.push({
+          message: `${repoConfig.githubRepo} #${num} released back to the implement queue — it carried a lifecycle label but no PR covers it and nothing merged, so the work never landed.`,
+          level: "warn",
+        });
+        processed++;
+      }
+    }
 
     // A hold ends when the issue leaves the dead zone (someone set the label or
     // closed it). Prune, or the record outlives the condition and would suppress
