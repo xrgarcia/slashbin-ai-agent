@@ -1,9 +1,59 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdirSync, createWriteStream, type WriteStream } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { verifyPRExists, checkPRHasChanges, getRemoteBranchSha } from "./github.js";
+
+/**
+ * Describe a non-zero exit WITHOUT letting stderr impersonate the root cause.
+ *
+ * The previous form was `stderr || stdoutTail || exitCode`, which put stderr
+ * FIRST. The Claude CLI writes benign startup noise to stderr on every run — an
+ * untrusted-workspace notice, deprecation warnings — so whenever a run failed
+ * for an unrelated reason, that noise became the entire reported error and the
+ * real cause was never recorded anywhere.
+ *
+ * Observed 2026-08-04 on slashbin-io-worker cycle 1519: the run died 12.5
+ * minutes in and was reported as
+ * `Implementation failed: Ignoring 5 permissions.allow entries ...`.
+ * The identical warning appears on cycle 1520, which SUCCEEDED — so it could
+ * not have been the cause, and the actual reason is unrecoverable. Ray brought
+ * that message in as the failure; it was never even a symptom.
+ *
+ * The fix is precedence and labelling, not suppression: lead with the one
+ * unambiguous fact (the exit code), then the agent's own output, then stderr
+ * clearly marked as context. A warning can no longer appear alone, so it can no
+ * longer read as a diagnosis.
+ */
+export function describeSpawnFailure(result: { exitCode: number | null; stdout: string; stderr: string }): string {
+  // A null exit code means the process was terminated by a signal rather than
+  // returning — the OOM-killer and an abort both land here. "exit code null"
+  // would read as a missing value; say what actually happened.
+  const parts = [
+    result.exitCode === null
+      ? "terminated by signal (no exit code — killed, not returned)"
+      : `exit code ${result.exitCode}`,
+  ];
+  const stdoutTail = result.stdout.trim().slice(-500);
+  if (stdoutTail) parts.push(`stdout tail: ${stdoutTail}`);
+  const stderrMsg = result.stderr.trim().slice(-500);
+  if (stderrMsg) parts.push(`stderr (context, not necessarily the cause): ${stderrMsg}`);
+  return parts.join(" | ");
+}
+
+/**
+ * Transcript destination for a phase run, mirroring the review phase's layout
+ * (`logs/review/<repo>-cycleN-<ts>.log`).
+ *
+ * Implement and revise kept no transcript at all, so a failed implementation was
+ * unanalysable the moment it ended — there was nothing to read back. That is why
+ * cycle 1519's real failure is gone for good.
+ */
+function phaseTranscriptPath(phase: string, repoName: string): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  return join(process.cwd(), "logs", phase, `${repoName}-${ts}.log`);
+}
 
 export interface RevisionResult {
   success: boolean;
@@ -304,7 +354,8 @@ function spawnClaude(
   prompt: string,
   config: RepoConfig,
   logger: Logger,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  transcriptPath?: string
 ): Promise<SpawnResult> {
   return spawnClaudeWithOptions(
     prompt,
@@ -315,6 +366,7 @@ function spawnClaude(
       allowedTools: config.allowedTools,
       maxTurns: config.maxTurns,
       maxDurationMs: config.maxDurationMs,
+      transcriptPath,
     },
     logger,
     abortSignal
@@ -393,16 +445,16 @@ Work autonomously. Do not ask questions.`;
     prompt += `\n\nIMPORTANT — PRIOR ATTEMPT FAILED: "${priorFailureReason}". Ensure you: (1) commit changes to the ${config.featureBranch} branch, (2) push to origin, (3) create a PR targeting ${config.baseBranch} using \`gh pr create\`. If a PR already exists, push new commits to it.`;
   }
 
-  const result = await spawnClaude(prompt, config, logger, abortSignal);
+  const transcriptPath = phaseTranscriptPath("implement", config.name);
+  logger.info(`Transcript: ${transcriptPath}`);
+  const result = await spawnClaude(prompt, config, logger, abortSignal, transcriptPath);
 
   if (result.timedOut) {
     return { success: false, error: "timed out" };
   }
 
   if (result.exitCode !== 0) {
-    const stderrMsg = result.stderr.trim();
-    const stdoutTail = result.stdout.trim().slice(-500);
-    const error = stderrMsg || stdoutTail || `exit code ${result.exitCode}`;
+    const error = describeSpawnFailure(result);
     logger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
   }
@@ -546,16 +598,16 @@ ${IMAGE_HANDLING_INSTRUCTIONS}
 Work autonomously. Do not ask questions.`;
   }
 
-  const result = await spawnClaude(prompt, config, logger, abortSignal);
+  const transcriptPath = phaseTranscriptPath("revise", config.name);
+  logger.info(`Transcript: ${transcriptPath}`);
+  const result = await spawnClaude(prompt, config, logger, abortSignal, transcriptPath);
 
   if (result.timedOut) {
     return { success: false, error: "timed out" };
   }
 
   if (result.exitCode !== 0) {
-    const stderrMsg = result.stderr.trim();
-    const stdoutTail = result.stdout.trim().slice(-500);
-    const error = stderrMsg || stdoutTail || `exit code ${result.exitCode}`;
+    const error = describeSpawnFailure(result);
     logger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
   }
@@ -673,9 +725,7 @@ ${IMAGE_HANDLING_INSTRUCTIONS}`;
   }
 
   if (result.exitCode !== 0) {
-    const stderrMsg = result.stderr.trim();
-    const stdoutTail = result.stdout.trim().slice(-500);
-    const error = stderrMsg || stdoutTail || `exit code ${result.exitCode}`;
+    const error = describeSpawnFailure(result);
     logger.error(`Review Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
   }
