@@ -1319,12 +1319,16 @@ function tryPromotion(
     if (cycleNumber - last >= STALL_CHECK_CYCLE_INTERVAL) {
       lastStallCheckCycle.set(repoName, cycleNumber);
       const drift = checkBranchDrift(repoConfig.githubRepo, repoConfig.repoPath, promoLogger);
-      if (drift && drift.developAheadOfMain > 0) {
+      // Gate on CHANGED FILES, never on commit count. Every repo sits 1 commit
+      // ahead in the steady state — the main -> develop sync PR's merge commit,
+      // which carries no file change. Warning on `ahead > 0` fires on every repo
+      // on every check, forever, and a warning that is always on is not a signal.
+      if (drift && drift.developAheadFiles > 0) {
         promoLogger.warn(
-          `${repoName}: develop is ${drift.developAheadOfMain} commit(s) ahead of main but no issue carries ` +
-          `"${EM_GATE_LABEL}" — promotion is STALLED, not idle. Either the EM gate has not been signed yet, ` +
-          `or it was signed and revoked.`,
-          { developAheadOfMain: drift.developAheadOfMain },
+          `${repoName}: develop carries ${drift.developAheadFiles} changed file(s) not on main ` +
+          `(${drift.developAheadOfMain} commit(s) ahead) but no issue carries "${EM_GATE_LABEL}" — ` +
+          `promotion is STALLED, not idle. Either the EM gate has not been signed yet, or it was signed and revoked.`,
+          { developAheadOfMain: drift.developAheadOfMain, developAheadFiles: drift.developAheadFiles },
         );
       }
     }

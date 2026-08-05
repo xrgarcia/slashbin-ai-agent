@@ -1633,6 +1633,8 @@ export function getRemoteBranchSha(
 export interface BranchDrift {
   developBehindMain: number;
   developAheadOfMain: number;
+  /** Files differing between main and develop. Zero means merge-commit-only drift. */
+  developAheadFiles: number;
 }
 
 /**
@@ -1647,13 +1649,19 @@ export function checkBranchDrift(
   try {
     const json = gh([
       "api", `repos/${repo}/compare/main...develop`,
-      "--jq", '{"ahead": .ahead_by, "behind": .behind_by}',
+      "--jq", '{"ahead": .ahead_by, "behind": .behind_by, "files": ((.files // []) | length)}',
     ], cwd);
 
     const result = JSON.parse(json);
     return {
       developAheadOfMain: result.ahead,
       developBehindMain: result.behind,
+      // Changed files between main and develop. `ahead > 0 && files === 0` is the
+      // NORMAL steady state, not a stall: the main -> develop sync PR leaves a
+      // merge commit on develop that main does not have, carrying no file change.
+      // Counting commits alone flags every repo, forever. GitHub truncates this
+      // array on very large diffs but never empties it, so 0 really means 0.
+      developAheadFiles: result.files ?? 0,
     };
   } catch (err) {
     logger.error("Failed to check branch drift", {
