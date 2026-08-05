@@ -205,8 +205,14 @@ function reconcileReviewOutcomeLabels(
   for (const issueNumber of stuck) {
     const ref = byIssue.get(issueNumber);
     if (!ref) {
-      // No merged PR closes it — it is not in the dead zone at all; the PR is
-      // still open and the issue is correctly `pr under review`.
+      // Could not tie this issue to a merged PR. That is EITHER "its PR is still
+      // open, so `pr under review` is correct" OR "the lookup failed" —
+      // findIssuesMergedToBase returns [] for both. Report it rather than pick:
+      // treating a failed lookup as "nothing to fix" is the same silent-skip that
+      // let this whole class of bug run for months. Unresolved keeps the existing
+      // dead-zone warning, which is exactly what fired here before this function
+      // existed, so this is never noisier than the behavior it replaced.
+      unresolved.push(issueNumber);
       continue;
     }
     const trailer = trailers.find((t) => t.pr === ref.prNumber);
