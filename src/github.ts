@@ -1098,6 +1098,139 @@ export function transitionReviewOutcomeLabel(
 }
 
 /**
+ * The label that authorizes production. Only the EM outcome-gate applies it, and
+ * nothing in the review path may take it away.
+ */
+export const EM_GATE_LABEL = "ready for prod release";
+
+/**
+ * Which of `issueNumbers` currently carry the EM outcome-gate label.
+ *
+ * Taken as a snapshot BEFORE a review run so the same set can be checked after
+ * it. `findPRsNeedingReview` already excludes issues that have advanced — but it
+ * evaluates that at TRIGGER time, and a review run lasts minutes. An EM gate
+ * signed while the run is in flight passes the trigger check and is then
+ * overwritten by the run's own label write.
+ *
+ * Returns [] on any failure, which means "restore nothing" — a lookup that fails
+ * must never manufacture a label that was not there.
+ */
+export function snapshotEmGate(
+  repo: string,
+  cwd: string,
+  issueNumbers: number[],
+  logger: Logger,
+): number[] {
+  if (issueNumbers.length === 0) return [];
+  try {
+    dropIssueSnapshot(repo);
+    const open = getOpenIssues(repo, cwd, logger);
+    return issueNumbers.filter((num) => {
+      const issue = open.find((i) => i.number === num);
+      return issue ? hasLabel(issue, EM_GATE_LABEL) : false;
+    });
+  } catch (err) {
+    logger.warn(`snapshotEmGate failed for ${repo}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+export interface EmGateRestoreStep {
+  number: number;
+  /** The review wrote `pr approved` in the gate's place — strip it on the way back. */
+  dropPrApproved: boolean;
+}
+
+/**
+ * Decide, with no I/O, which issues need their EM outcome-gate put back.
+ *
+ * Split out from `restoreEmGate` so the decision is testable without a network:
+ * the rules about what counts as "revoked" are the part worth pinning, and the
+ * `gh` call around them is not.
+ *
+ * Restores only issues that (a) carried the gate before the run, (b) are still
+ * open, and (c) no longer carry it. A closed issue needs no gate — the promotion
+ * either happened or the work was abandoned, and re-labeling a closed issue would
+ * put it back in the Foreman's pickup list for no reason.
+ */
+export function planEmGateRestore(
+  hadGate: number[],
+  open: { number: number; labels: { name: string }[] }[],
+): EmGateRestoreStep[] {
+  const steps: EmGateRestoreStep[] = [];
+  for (const num of hadGate) {
+    const issue = open.find((i) => i.number === num);
+    if (!issue) continue;                                   // closed — nothing to restore
+    const names = new Set(issue.labels.map((l) => l.name));
+    if (names.has(EM_GATE_LABEL)) continue;                 // still signed — healthy path
+    steps.push({ number: num, dropPrApproved: names.has("pr approved") });
+  }
+  return steps;
+}
+
+/**
+ * Put back any EM outcome-gate label that disappeared across a review run.
+ *
+ * The review agent writes issue labels itself, so the Foreman cannot intercept
+ * that write — it can only detect the damage and undo it. This is the structural
+ * half of a rule that until now existed only as a sentence in the review prompt.
+ *
+ * Why it matters that this is silent without the check: `tryPromotion` calls
+ * `findReadyForProdIssues`, which filters on exactly this label, and returns
+ * early on an empty set. A revoked gate produces no PR, no error and no log line
+ * — indistinguishable from having nothing to promote. Observed on
+ * Slashbin-io-docs, 2026-08-04: the gate was signed at 20:20:15Z, overwritten
+ * with `pr approved` at 20:22:12Z by a review run that started at 20:11:59Z, and
+ * the promotion sat stalled for an hour until a human noticed the absence.
+ *
+ * A review verdict is never authority to revoke production authorization, so
+ * restoring is unconditional. `pr approved` is stripped only when present — it is
+ * the label the review wrote in the gate's place, and the two are different
+ * lifecycle states, not additive ones.
+ *
+ * Returns the issues actually restored (usually none — the healthy path).
+ */
+export function restoreEmGate(
+  config: RepoConfig,
+  hadGate: number[],
+  logger: Logger,
+): number[] {
+  if (hadGate.length === 0) return [];
+  const restored: number[] = [];
+  try {
+    dropIssueSnapshot(config.githubRepo);
+    const open = getOpenIssues(config.githubRepo, config.repoPath, logger);
+    for (const step of planEmGateRestore(hadGate, open)) {
+      const { number: num, dropPrApproved } = step;
+      const args = [
+        "issue", "edit", String(num),
+        "--repo", config.githubRepo,
+        "--add-label", EM_GATE_LABEL,
+      ];
+      // Only remove what is actually there; `gh` errors on removing an absent label.
+      if (dropPrApproved) args.push("--remove-label", "pr approved");
+
+      try {
+        gh(args, config.repoPath);
+        restored.push(num);
+        logger.warn(
+          `Restored "${EM_GATE_LABEL}" on #${num} — the review run removed it. ` +
+          `A review verdict does not authorize or revoke production; only the EM outcome-gate does.`,
+        );
+      } catch (err) {
+        logger.error(
+          `Failed to restore "${EM_GATE_LABEL}" on #${num} — promotion is STALLED until a human re-applies it: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  } catch (err) {
+    logger.warn(`restoreEmGate failed for ${config.githubRepo}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return restored;
+}
+
+/**
  * Move a dead-zoned issue out of `pr under review` once a FRESH verification has
  * produced a verdict: `pr approved` on PASS, `pr pending actions` on FAIL.
  *

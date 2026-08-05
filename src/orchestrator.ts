@@ -33,6 +33,9 @@ import {
   findIssuesStillUnderReview,
   resolveDeadZone,
   transitionReviewOutcomeLabel,
+  snapshotEmGate,
+  restoreEmGate,
+  EM_GATE_LABEL,
 } from "./github.js";
 import type { ReviewTrailer } from "./agent.js";
 import { loadRepoState, saveRepoState } from "./state.js";
@@ -53,6 +56,11 @@ const failureHitMaxAt = new Map<string, number>(); // cycle when max was hit
 const revisionFailureCount = new Map<string, number>();
 const reviewFailureCount = new Map<string, number>();
 const reviewFailureHitMaxAt = new Map<string, number>();
+
+// Last cycle on which each repo checked whether an empty ready-for-prod set is
+// actually a stall. Rate-limits one compare API call per repo; see tryPromotion.
+const lastStallCheckCycle = new Map<string, number>();
+const STALL_CHECK_CYCLE_INTERVAL = 12;
 
 /** Per-repo set of issue numbers already alerted as dead-zoned, so a STANDING
  *  condition alerts once instead of every reconcile cycle. Cleared per-issue when
@@ -1142,6 +1150,14 @@ async function tryReview(
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const transcriptPath = resolve(process.cwd(), "logs", "review", `${repoName}-cycle${cycleNumber}-${ts}.log`);
 
+  // Snapshot the EM outcome-gate BEFORE the run. `findPRsNeedingReview` already
+  // excludes advanced issues, but it decided that minutes ago; a gate signed
+  // while this run is in flight is invisible to it and gets overwritten by the
+  // run's own label write. Restored in `finally`, so a crash cannot strand it.
+  const gatedBeforeReview = snapshotEmGate(
+    repoConfig.githubRepo, repoConfig.repoPath, candidate.issueNumbers, reviewLogger,
+  );
+
   const runAbort = new AbortController();
   activeRuns.set(repoName, runAbort);
   reviewLogger.info(`Triggering review for ${repoName} — PR #${candidate.prNumber} (issues: ${candidate.issueNumbers.map(n => `#${n}`).join(", ")}), transcript: ${transcriptPath}`);
@@ -1224,6 +1240,16 @@ async function tryReview(
     return false;
   } finally {
     activeRuns.delete(repoName);
+
+    // Undo any revocation of the EM outcome-gate. In `finally` on purpose: a run
+    // that threw or was aborted may still have written labels before it died.
+    const restored = restoreEmGate(repoConfig, gatedBeforeReview, reviewLogger);
+    if (restored.length > 0) {
+      events?.push({
+        message: `⚠️ ${repoConfig.githubRepo} — the review run removed "${EM_GATE_LABEL}" from issue(s) ${restored.map((n) => `#${n}`).join(", ")}; restored. Promotion would otherwise have stalled silently.`,
+        level: "warn",
+      });
+    }
   }
 }
 
@@ -1280,7 +1306,30 @@ function tryPromotion(
   }
 
   const issues = findReadyForProdIssues(repoConfig.githubRepo, repoConfig.repoPath, promoLogger);
-  if (issues.length === 0) return null;
+  if (issues.length === 0) {
+    // "Nothing ready to promote" and "the gate was revoked and promotion is
+    // stalled" produce the identical empty set and the identical silence. They
+    // are distinguishable by one fact: whether `develop` is carrying merged work
+    // that never reached `main`. Say so when it is.
+    //
+    // Rate-limited because it costs a compare API call and the discovery budget
+    // is repos x cycles/hour (see docs on the GitHub API budget) — a stall lasts
+    // cycles, so hourly is early enough to catch it and cheap enough to keep.
+    const last = lastStallCheckCycle.get(repoName) ?? -Infinity;
+    if (cycleNumber - last >= STALL_CHECK_CYCLE_INTERVAL) {
+      lastStallCheckCycle.set(repoName, cycleNumber);
+      const drift = checkBranchDrift(repoConfig.githubRepo, repoConfig.repoPath, promoLogger);
+      if (drift && drift.developAheadOfMain > 0) {
+        promoLogger.warn(
+          `${repoName}: develop is ${drift.developAheadOfMain} commit(s) ahead of main but no issue carries ` +
+          `"${EM_GATE_LABEL}" — promotion is STALLED, not idle. Either the EM gate has not been signed yet, ` +
+          `or it was signed and revoked.`,
+          { developAheadOfMain: drift.developAheadOfMain },
+        );
+      }
+    }
+    return null;
+  }
 
   promoLogger.info(`Found ${issues.length} issue(s) ready for prod release`);
 

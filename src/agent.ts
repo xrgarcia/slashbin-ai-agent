@@ -703,7 +703,7 @@ Review the open feature PRs for the repository \`${repoConfig.githubRepo}\` ONLY
 Follow the skill exactly and act autonomously — do NOT ask questions or wait for confirmation:
 - Run the relevant healthchecks first (skill Phase 0).
 - Review each open \`features → develop\` PR (skill Phase 3): the Fix-Completeness gate first, then the rubric.
-- For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`pr approved\` per the skill. Do NOT apply \`ready for prod release\` — that label is the EM outcome-gate's signature (separation of duties; see /review-pr Step 17).
+- For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`pr approved\` per the skill. Do NOT apply \`ready for prod release\`, and do NOT remove it either — that label is the EM outcome-gate's signature (separation of duties; see /review-pr Step 17). If a linked issue already carries it, the EM has signed off ahead of you: leave that issue's labels alone entirely. Removing it silently blocks the promotion PR forever, so the Foreman now detects and restores it — but a restore is a repaired mistake, not a supported path.
 - For BLOCKED PRs: post REQUEST_CHANGES, label the linked issue \`pr pending actions\`, and file S3/S4 follow-up issues per the skill.
 - Update issue labels yourself exactly as the skill specifies. The orchestrator reconciles the outcome label from your trailer only when you left it unset — it never overrides a label you did set.
 
