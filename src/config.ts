@@ -87,6 +87,24 @@ const configSchema = z.object({
   // so it gets a much larger turn/duration budget than implement/revise.
   reviewMaxTurns: z.coerce.number().int().positive().default(200),
   reviewMaxDurationMs: z.coerce.number().int().positive().default(3_600_000),
+  // After a review run, set the issue's outcome label from the run's own
+  // FOREMAN_REVIEW trailer when the skill merged the PR but left the issue at
+  // `pr under review`. Defaults to true.
+  //
+  // Default-on is safe for existing deployments because the reconciler is a
+  // REPAIR, not a policy: it only writes when the expected label is absent, only
+  // for an issue a merged PR provably closed, and only to the label the run
+  // itself reported. A skill that labels correctly never reaches the write — the
+  // behavior of a healthy pipeline is bit-for-bit unchanged. Set false to keep
+  // the label a strictly agent-owned act.
+  //
+  // NOT z.coerce.boolean(): env vars arrive as strings and Boolean("false") is
+  // true, so coercion would silently ignore the one value anyone disabling this
+  // would actually type.
+  reviewLabelReconcile: z.preprocess(
+    (v) => (typeof v === "string" ? !/^(0|false|no|off)$/i.test(v.trim()) : v),
+    z.boolean(),
+  ).default(true),
   // Broad tool surface — the skill drives GitHub, Postgres, Redis, Railway, and
   // the knowledge index via MCP, plus shell scripts and file reads.
   reviewAllowedTools: z.array(z.string()).default([
@@ -158,6 +176,7 @@ export interface AgentConfig {
   reviewMaxDurationMs: number;
   reviewAllowedTools: string[];
   reviewerLogin: string;
+  reviewLabelReconcile: boolean;
 }
 
 // --- Helpers ---
@@ -222,6 +241,7 @@ export function loadConfig(configPath?: string): AgentConfig {
     reviewMaxDurationMs: process.env.AI_AGENT_REVIEW_MAX_DURATION_MS ?? fileConfig.reviewMaxDurationMs,
     reviewAllowedTools: fileConfig.reviewAllowedTools,
     reviewerLogin: fileConfig.reviewerLogin,
+    reviewLabelReconcile: process.env.AI_AGENT_REVIEW_LABEL_RECONCILE ?? fileConfig.reviewLabelReconcile,
   };
 
   // Remove undefined keys so Zod defaults apply
@@ -325,5 +345,6 @@ export function loadConfig(configPath?: string): AgentConfig {
     reviewMaxDurationMs: parsed.reviewMaxDurationMs,
     reviewAllowedTools: [...parsed.reviewAllowedTools],
     reviewerLogin: parsed.reviewerLogin,
+    reviewLabelReconcile: parsed.reviewLabelReconcile,
   });
 }

@@ -35,7 +35,7 @@ Reconciliation → Review → Revision → Implementation → Branch Sync → Pr
 ```
 
 1. **Reconcile** — detects orphaned commits on the features branch with no PR and creates one
-2. **Review** *(opt-in)* — when `reviewEnabled` is set, invokes a review skill on open feature PRs awaiting review. The review skill runs in a **separate review repo** (`emRepoPath`) under a separate GitHub token, and owns its own merge + label decisions; its label side effects (approve → ready-for-prod; request-changes → pending-actions) feed the Promote and Revise phases. Disabled by default — see [Review phase](#review-phase-opt-in)
+2. **Review** *(opt-in)* — when `reviewEnabled` is set, invokes a review skill on open feature PRs awaiting review. The review skill runs in a **separate review repo** (`emRepoPath`) under a separate GitHub token, and owns its own merge + label decisions; its label side effects (approve → `pr approved`; request-changes → `pr pending actions`) feed the Promote and Revise phases, and the Foreman reconciles the outcome label from the run's trailer if the skill merged without setting it. Disabled by default — see [Review phase](#review-phase-opt-in)
 3. **Revise** — finds PRs with pending review feedback and revises them (prioritized over new work)
 4. **Implement** — picks up approved issues and invokes the repo's implementation skill via Claude Code (up to 3 issues per cycle; 1 in greenfield repos)
 5. **Branch Sync** — merges main → develop to keep branches aligned after promotions
@@ -244,9 +244,61 @@ decision-layer workflow rather than an in-repo edit:
   behind `EM_GITHUB_TOKEN` (distinct from `FOREMAN_GITHUB_TOKEN`), keeping the
   reviewer identity separate from the implementer identity.
 - **Owns its own outcomes.** The skill posts the verdict, merges approved PRs, and
-  transitions issue labels itself — the Foreman does not relabel afterward. The label
-  side effects feed the other phases: approve → `ready for prod release` (Promote);
-  request-changes → `pr pending actions` (Revise).
+  transitions issue labels itself. The label side effects feed the other phases:
+  approve → `pr approved` (awaiting the human release gate); request-changes →
+  `pr pending actions` (Revise). The Foreman reconciles the label as a backstop
+  when the skill merged without setting it — see below.
+
+### Outcome-label reconciliation
+
+The merge is performed by code, but the *record* of what the merge meant used to be
+left entirely to the review agent to remember to write. When a session ended after
+merging but before labeling, the issue stayed at `pr under review` with its PR
+already closed — invisible to every phase, since the review gate only matches OPEN
+PRs. Measured over one week on a 20-repo fleet: **12 of 53 merges (~23%) stranded
+their issue this way.**
+
+The outcome was never actually unknown — it arrives in the `FOREMAN_REVIEW` trailer
+the Foreman already parses. `reviewLabelReconcile` (default `true`) spends it: after
+a run reports a merge, any linked issue still sitting at `pr under review` is moved
+to the label its own trailer implies.
+
+Four conditions gate every write, so the reconciler can only ever repair a missing
+write — never invent one, never overrule anyone:
+
+1. the issue is still at `pr under review` with no outcome label (a skill that
+   labels correctly never reaches this code, so a healthy pipeline is unchanged);
+2. a **merged** PR provably closed that issue, under the strict closing-keyword
+   predicate (a bare "related to #N" never counts);
+3. that PR emitted a trailer this run whose fields are unambiguous;
+4. the reviewer did not declare a hold (below).
+
+It never applies `ready for prod release`. That label authorizes production and
+remains a human act.
+
+Set `reviewLabelReconcile: false` (or `AI_AGENT_REVIEW_LABEL_RECONCILE=false`) to
+keep labeling strictly agent-owned.
+
+### Declaring a deliberate hold
+
+A reviewer that merges but *intentionally* leaves the label unset — typically an
+acceptance criterion that cannot be observed yet — appends an optional `hold=` field
+to that PR's trailer:
+
+```
+FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS hold=criterion-not-observable-until-0300z
+```
+
+The Foreman then neither sets the label nor re-verifies behind it, and surfaces the
+issue as *held* rather than failed. The hold is persisted in `.agent-state.json`, so
+it survives restarts, and clears automatically once the issue leaves the dead zone.
+
+Without this, a deliberate hold and a dropped label are the same observation, and
+automation has to guess — which means overwriting a correct judgment with a rubber
+stamp.
+
+The four-field trailer remains the contract: `hold=` is optional and trails the
+original fields, so trailers written before it existed parse identically.
 
 Every review run's full turn-by-turn interaction (`--output-format stream-json`) is
 written verbatim to `logs/review/<repo>-cycle<N>-<timestamp>.log` for debugging.
@@ -268,6 +320,7 @@ Review config keys (all optional; global, with a per-repo `reviewEnabled` overri
 | `reviewMaxDurationMs` | `3600000` (60 min) | Max review duration |
 | `reviewAllowedTools` | broad MCP + shell set | Tool surface for the review skill |
 | `reviewerLogin` | `slashbin-engineering-manager` | GitHub login the review runs as (freshness guard) |
+| `reviewLabelReconcile` | `true` | Set the outcome label from the run's own trailer when the skill merged without labeling. Env: `AI_AGENT_REVIEW_LABEL_RECONCILE` |
 
 Requires `EM_GITHUB_TOKEN` in the environment when enabled.
 

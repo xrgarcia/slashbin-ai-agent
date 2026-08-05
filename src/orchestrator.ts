@@ -32,7 +32,9 @@ import {
   transitionToReadyForProd,
   findIssuesStillUnderReview,
   resolveDeadZone,
+  transitionReviewOutcomeLabel,
 } from "./github.js";
+import type { ReviewTrailer } from "./agent.js";
 import { loadRepoState, saveRepoState } from "./state.js";
 
 const MAX_RETRIES = 2;
@@ -141,6 +143,120 @@ function recoverDeadZonedIssue(
     `Dead-zone recovery INDETERMINATE for #${issueNumber} — verifier exited ${run.status} (no verdict; repo may have no service mapping): ${(run.stderr || "").split("\n")[0]}`,
   );
   return "indeterminate";
+}
+
+/**
+ * The label a review run's own trailer implies for the issues its PR closed, or
+ * null when the trailer does not warrant a write.
+ *
+ * Null is the important half. The reconciler exists to repair a MISSING write,
+ * never to invent one, so anything the trailer does not say plainly is left for a
+ * human — an unmerged PR (the issue is legitimately still under review), or a
+ * self-contradictory report like `verdict=REQUEST_CHANGES merged=yes`.
+ *
+ * `deploy=NA` is a PASS, not an absence: it is what a repo with nothing to deploy
+ * (docs, CLI, npm package) is instructed to emit.
+ */
+export function labelFromTrailer(t: ReviewTrailer): "pr approved" | "pr pending actions" | null {
+  if (!t.merged) return null;
+  if (t.verdict !== "APPROVE") return null;
+  if (/^(FAIL|FAILURE|FAILED)$/.test(t.deploy)) return "pr pending actions";
+  if (/^(SUCCESS|OK|PASS|PASSED|NA|N\/A|NONE)$/.test(t.deploy)) return "pr approved";
+  return null;
+}
+
+/**
+ * Set the outcome label the review run reported, for issues it merged but left at
+ * `pr under review`.
+ *
+ * This is the fix for the pipeline's oldest silent failure: the merge was done by
+ * code while the RECORD of it was left to an agent to remember to write, so ~23%
+ * of merges (12 of 53 over 2026-07-29 → 08-04) stranded their issue in a state no
+ * phase reads. The outcome was never actually unknown — it arrived in a
+ * machine-readable trailer the Foreman already parsed and logged. This spends it.
+ *
+ * Four independent conditions gate every write, so the reconciler cannot invent
+ * state or overrule anyone:
+ *   1. the issue is STILL at `pr under review` with no outcome label — a run that
+ *      labeled correctly never reaches this code, so healthy behavior is unchanged;
+ *   2. a merged PR provably closed that issue, via the same STRICT predicate the
+ *      promotion path uses (`findIssuesMergedToBase` — a bare "related to #N"
+ *      never counts);
+ *   3. that PR has a trailer from THIS run whose fields are unambiguous;
+ *   4. the reviewer did not declare a deliberate hold.
+ *
+ * It never applies `ready for prod release`: that label authorizes production and
+ * stays the EM outcome-gate's signature (separation of duties, 2026-07-27).
+ *
+ * Returns the issues still stuck after reconciliation — the genuine dead zone.
+ */
+function reconcileReviewOutcomeLabels(
+  repoConfig: RepoConfig,
+  stuck: number[],
+  trailers: ReviewTrailer[],
+  logger: Logger,
+  events?: CycleEvent[],
+): number[] {
+  const merged = findIssuesMergedToBase(repoConfig, stuck, logger);
+  const byIssue = new Map(merged.map((m) => [m.issueNumber, m]));
+  const unresolved: number[] = [];
+  let held: { issue: number; reason: string; pr: number }[] = [];
+
+  for (const issueNumber of stuck) {
+    const ref = byIssue.get(issueNumber);
+    if (!ref) {
+      // No merged PR closes it — it is not in the dead zone at all; the PR is
+      // still open and the issue is correctly `pr under review`.
+      continue;
+    }
+    const trailer = trailers.find((t) => t.pr === ref.prNumber);
+    if (!trailer) {
+      unresolved.push(issueNumber);
+      continue;
+    }
+    if (trailer.hold) {
+      held.push({ issue: issueNumber, reason: trailer.hold, pr: ref.prNumber });
+      continue;
+    }
+    const label = labelFromTrailer(trailer);
+    if (!label) {
+      logger.warn(
+        `Not reconciling #${issueNumber}: PR #${ref.prNumber}'s trailer is ambiguous (verdict=${trailer.verdict} merged=${trailer.merged} deploy=${trailer.deploy}) — leaving it for a human`,
+      );
+      unresolved.push(issueNumber);
+      continue;
+    }
+    if (transitionReviewOutcomeLabel(repoConfig, issueNumber, label, logger)) {
+      events?.push({
+        message: `${repoConfig.githubRepo} #${issueNumber} — review merged PR #${ref.prNumber} without labeling; reconciled to "${label}" from its own trailer`,
+        level: label === "pr approved" ? "info" : "warn",
+      });
+    } else {
+      unresolved.push(issueNumber);
+    }
+  }
+
+  // Persist declared holds so neither this reconciler nor the dead-zone recovery
+  // overwrites a deliberate decision on a later cycle or after a restart. The
+  // in-memory skip sets would not survive either.
+  if (held.length > 0) {
+    const state = loadRepoState(repoConfig.name);
+    if (!state.held) state.held = {};
+    const at = new Date().toISOString();
+    for (const h of held) {
+      state.held[h.issue] = { heldAt: at, prNumber: h.pr, reason: h.reason };
+      logger.info(
+        `#${h.issue} held by the reviewer (PR #${h.pr}): ${h.reason} — leaving "pr under review" in place, not re-verifying`,
+      );
+      events?.push({
+        message: `⏸️ ${repoConfig.githubRepo} #${h.issue} held by review: ${h.reason} (PR #${h.pr} merged; label intentionally withheld)`,
+        level: "info",
+      });
+    }
+    saveRepoState(repoConfig.name, state);
+  }
+
+  return unresolved;
 }
 
 export interface OrchestratorState {
@@ -343,7 +459,29 @@ async function runRepoCycle(
     const seen = deadZoneAlerted.get(repoConfig.name) ?? new Set<number>();
     const tried = deadZoneRecoveryAttempted.get(repoConfig.name) ?? new Set<number>();
     const current = new Set(stuck.map((s) => s.issueNumber));
+
+    // Issues whose reviewer DECLARED a hold are not dead — they are waiting on
+    // purpose. Auto-recovery would re-verify and label them anyway, replacing a
+    // human-grade judgment ("this criterion is not observable until 03:00Z") with
+    // an automated verdict. Surface them, never overwrite them.
+    const repoState = loadRepoState(repoConfig.name);
+    const heldIssues = repoState.held ?? {};
+
     for (const s of stuck) {
+      const hold = heldIssues[s.issueNumber];
+      if (hold) {
+        if (!seen.has(s.issueNumber)) {
+          seen.add(s.issueNumber);
+          reconLogger.info(
+            `Issue #${s.issueNumber} is HELD by its review (PR #${s.prNumber}, since ${hold.heldAt}): ${hold.reason} — not auto-recovering`,
+          );
+          events.push({
+            message: `⏸️ ${repoConfig.githubRepo} #${s.issueNumber} held by review since ${hold.heldAt.slice(0, 16)}: ${hold.reason}. EM: resolve when the criterion can be checked.`,
+            level: "info",
+          });
+        }
+        continue;
+      }
       // --- Recovery first, alert only if it could not be repaired ----------
       // Attempt once per (repo, issue). A second attempt only repeats whatever
       // made the first indeterminate, at the cost of another deploy poll.
@@ -386,6 +524,19 @@ async function runRepoCycle(
     for (const n of [...tried]) if (!current.has(n)) tried.delete(n);
     deadZoneAlerted.set(repoConfig.name, seen);
     deadZoneRecoveryAttempted.set(repoConfig.name, tried);
+
+    // A hold ends when the issue leaves the dead zone (someone set the label or
+    // closed it). Prune, or the record outlives the condition and would suppress
+    // recovery on a genuine re-entry months later.
+    const stale = Object.keys(heldIssues).map(Number).filter((n) => !current.has(n));
+    if (stale.length > 0) {
+      const fresh = loadRepoState(repoConfig.name);
+      if (fresh.held) {
+        for (const n of stale) delete fresh.held[n];
+        saveRepoState(repoConfig.name, fresh);
+        reconLogger.debug(`Cleared ${stale.length} resolved hold(s): #${stale.join(", #")}`);
+      }
+    }
   } catch (err) {
     reconLogger.debug(
       `Dead-zone detection failed for ${repoConfig.name}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1014,18 +1165,38 @@ async function tryReview(
       // where it can re-verify first. Alerting here rather than waiting for the
       // dead-zone sweep skips that path's 15-minute grace window, so a broken
       // run surfaces in the same cycle that produced it.
-      const mergedPrs = (result.trailers ?? []).filter((t) => t.merged).map((t) => t.pr);
+      const trailers = result.trailers ?? [];
+      const mergedPrs = trailers.filter((t) => t.merged).map((t) => t.pr);
       if (mergedPrs.length > 0) {
         const stuck = findIssuesStillUnderReview(repoConfig, candidate.issueNumbers, reviewLogger);
         if (stuck.length > 0) {
-          reviewLogger.error(
-            `Review post-condition FAILED on ${repoName}: PR(s) #${mergedPrs.join(", #")} reported merged, but issue(s) #${stuck.join(", #")} are still "pr under review" — the run merged without completing the label transition`,
+          reviewLogger.warn(
+            `Review post-condition: PR(s) #${mergedPrs.join(", #")} reported merged, but issue(s) #${stuck.join(", #")} are still "pr under review" — the run merged without completing the label transition`,
             { mergedPrs, stuckIssues: stuck },
           );
-          events?.push({
-            message: `⚠️ ${repoConfig.githubRepo} — review merged PR #${mergedPrs.join(", #")} but left issue(s) #${stuck.join(", #")} at "pr under review". Dead-zone recovery will re-verify next cycle.`,
-            level: "warn",
-          });
+
+          // Set the label from the run's own trailer. The verdict is not missing
+          // — it is right here, already parsed. Waiting a cycle to re-derive it
+          // from a fresh deploy poll was spending minutes to recompute an answer
+          // we were holding.
+          const unresolved = config.reviewLabelReconcile
+            ? reconcileReviewOutcomeLabels(repoConfig, stuck, trailers, reviewLogger, events)
+            : stuck;
+
+          if (!config.reviewLabelReconcile && stuck.length > 0) {
+            reviewLogger.info("Label reconciliation disabled (reviewLabelReconcile=false) — leaving the dead zone for recovery");
+          }
+
+          if (unresolved.length > 0) {
+            reviewLogger.error(
+              `Review post-condition UNRESOLVED on ${repoName}: issue(s) #${unresolved.join(", #")} could not be reconciled from the run's trailers — dead-zone recovery will re-verify`,
+              { mergedPrs, unresolved },
+            );
+            events?.push({
+              message: `⚠️ ${repoConfig.githubRepo} — review merged PR #${mergedPrs.join(", #")} but left issue(s) #${unresolved.join(", #")} at "pr under review" and the trailer could not settle it. Dead-zone recovery will re-verify next cycle.`,
+              level: "warn",
+            });
+          }
         }
       }
 

@@ -17,6 +17,15 @@ interface SkippedIssue {
   skipCount?: number;
 }
 
+interface HeldIssue {
+  /** ISO timestamp of the review run that declared the hold. */
+  heldAt: string;
+  /** The PR whose review declared it. */
+  prNumber: number;
+  /** Why the reviewer withheld the outcome label, verbatim from the trailer. */
+  reason: string;
+}
+
 export interface RepoState {
   implemented: number[];
   failed: Record<number, FailedIssue>;
@@ -25,6 +34,13 @@ export interface RepoState {
   // applies a back-off so we don't re-attempt every cycle.
   // Optional for backward compat with v2 state files written before this field existed.
   skipped?: Record<number, SkippedIssue>;
+  // Issues whose reviewer DELIBERATELY withheld the outcome label (trailer
+  // `hold=`), e.g. an acceptance criterion that cannot be observed until a later
+  // time boundary. Distinct from a dropped label: the reviewer reported the hold,
+  // so neither the label reconciler nor dead-zone recovery may overwrite it — a
+  // deliberate decision must not be rubber-stamped by an automated verdict.
+  // Optional for backward compat with state files written before this field existed.
+  held?: Record<number, HeldIssue>;
 }
 
 interface PersistedState {
@@ -85,6 +101,7 @@ export function loadRepoState(repoName: string): RepoState {
       implemented: [...repo.implemented],
       failed: { ...repo.failed },
       skipped: { ...(repo.skipped ?? {}) },
+      held: { ...(repo.held ?? {}) },
     };
   }
 
@@ -98,6 +115,7 @@ export function loadRepoState(repoName: string): RepoState {
       implemented: [...migrated.implemented],
       failed: { ...migrated.failed },
       skipped: { ...(migrated.skipped ?? {}) },
+      held: { ...(migrated.held ?? {}) },
     };
   }
 
@@ -105,6 +123,7 @@ export function loadRepoState(repoName: string): RepoState {
     implemented: [...EMPTY_REPO_STATE.implemented],
     failed: { ...EMPTY_REPO_STATE.failed },
     skipped: {},
+    held: {},
   };
 }
 

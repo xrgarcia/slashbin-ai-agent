@@ -66,6 +66,19 @@ export interface ReviewTrailer {
   verdict: string;
   merged: boolean;
   deploy: string;
+  /**
+   * Reason the reviewer DELIBERATELY withheld the issue's outcome label, from the
+   * optional `hold=` field. Undefined when the field is absent (every trailer
+   * written before this field existed) or when it says no/none/false.
+   *
+   * This exists to keep one honest case from being punished by the label
+   * reconciler: a reviewer that cannot yet judge an acceptance criterion (e.g. one
+   * that only becomes observable at a later time boundary) is RIGHT to leave the
+   * label alone, and must be able to say so. Without a way to declare it, a
+   * deliberate hold and a dropped label are the same observation, and automation
+   * has to guess — which means overwriting a correct judgment with a rubber stamp.
+   */
+  hold?: string;
 }
 
 export interface ReviewResult {
@@ -87,22 +100,27 @@ export interface ReviewResult {
  * acted on:
  *   FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS
  */
-function parseReviewTrailerRecords(stdout: string): ReviewTrailer[] {
+export function parseReviewTrailerRecords(stdout: string): ReviewTrailer[] {
   // Each field uses a bounded token alphabet ([\w/-]+) so it cannot bleed into
   // surrounding characters when the trailer is emitted inside a single-line
   // stream-JSON envelope (the Claude CLI's --output-format=stream-json), where
   // the characters immediately after the trailer (`"}],"STOP_REASON":NULL,…`)
   // are non-whitespace and would be greedily absorbed by an unbounded `\S+`.
-  const re = /FOREMAN_REVIEW\s+pr=#?(\d+)\s+verdict=([\w/-]+)\s+merged=([\w/-]+)\s+deploy=([\w/-]+)/gi;
+  // `hold=` is OPTIONAL and trails the original four fields, so every trailer
+  // written before it existed still matches with the group undefined. Do not
+  // reorder or make it required — the four-field form is the published contract.
+  const re = /FOREMAN_REVIEW\s+pr=#?(\d+)\s+verdict=([\w/-]+)\s+merged=([\w/-]+)\s+deploy=([\w/-]+)(?:\s+hold=([\w/-]+))?/gi;
   const out: ReviewTrailer[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(stdout)) !== null) {
-    const [, pr, verdict, merged, deploy] = m;
+    const [, pr, verdict, merged, deploy, hold] = m;
+    const holding = hold !== undefined && !/^(0|n|no|none|false|off)$/i.test(hold);
     out.push({
       pr: Number(pr),
       verdict: verdict.toUpperCase(),
       merged: /^(y|yes|true)$/i.test(merged),
       deploy: deploy.toUpperCase(),
+      ...(holding ? { hold } : {}),
     });
   }
   return out;
@@ -115,7 +133,8 @@ function formatReviewTrailers(trailers: ReviewTrailer[]): string | undefined {
     .map((t) => {
       const mergedTxt = t.merged ? "merged" : "not merged";
       const deployTxt = /^(NA|N\/A|NONE)$/.test(t.deploy) ? "no deploy" : `deploy ${t.deploy}`;
-      return `#${t.pr} ${t.verdict} · ${mergedTxt} · ${deployTxt}`;
+      const holdTxt = t.hold ? ` · HELD (${t.hold})` : "";
+      return `#${t.pr} ${t.verdict} · ${mergedTxt} · ${deployTxt}${holdTxt}`;
     })
     .join("; ");
 }
@@ -650,11 +669,15 @@ Work autonomously. Do not ask questions.`;
  *   - the broad reviewAllowedTools surface (GitHub/Postgres/Redis/Railway MCP)
  *
  * Full-fidelity: the skill posts verdicts, merges approved PRs to develop, verifies
- * dev, files S3/S4 follow-ups, and updates labels itself. The orchestrator does NOT
- * relabel after a review run — unlike implement/revise, the skill owns its own label
- * transitions. The review's label side effects feed the existing phases: APPROVE →
- * `pr approved` (awaiting the EM outcome-gate); REQUEST_CHANGES → `pr pending actions`
- * (revise phase).
+ * dev, files S3/S4 follow-ups, and updates labels itself. The review's label side
+ * effects feed the existing phases: APPROVE → `pr approved` (awaiting the EM
+ * outcome-gate); REQUEST_CHANGES → `pr pending actions` (revise phase).
+ *
+ * The skill remains the PRIMARY labeler — it does things the orchestrator cannot
+ * (post the review body, file the follow-ups that belong with the verdict). But it
+ * is no longer the ONLY one: the orchestrator reconciles the outcome label from the
+ * returned trailers when the skill merged without labeling. See
+ * `reconcileReviewOutcomeLabels` in orchestrator.ts for why the write moved.
  */
 export async function reviewOpenPRs(
   repoConfig: RepoConfig,
@@ -682,7 +705,7 @@ Follow the skill exactly and act autonomously — do NOT ask questions or wait f
 - Review each open \`features → develop\` PR (skill Phase 3): the Fix-Completeness gate first, then the rubric.
 - For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`pr approved\` per the skill. Do NOT apply \`ready for prod release\` — that label is the EM outcome-gate's signature (separation of duties; see /review-pr Step 17).
 - For BLOCKED PRs: post REQUEST_CHANGES, label the linked issue \`pr pending actions\`, and file S3/S4 follow-up issues per the skill.
-- Update issue labels yourself exactly as the skill specifies — the orchestrator will NOT relabel after you.
+- Update issue labels yourself exactly as the skill specifies. The orchestrator reconciles the outcome label from your trailer only when you left it unset — it never overrides a label you did set.
 
 CRITICAL — THIS IS A HEADLESS SESSION. THERE IS NO NEXT TURN.
 Ending your turn ends the process. Anything still running is killed at that instant, and everything you had not done yet never happens.
@@ -699,6 +722,14 @@ IMPORTANT — status trailer: After you finish, end your output with one line pe
 FOREMAN_REVIEW pr=#<number> verdict=<APPROVE|REQUEST_CHANGES> merged=<yes|no> deploy=<SUCCESS|FAILURE|NA>
 
 Rules for the trailer: \`merged=yes\` only if you actually merged the PR to the base branch. \`deploy=SUCCESS\`/\`deploy=FAILURE\` reflects the post-merge deployment+verification result for that merge (use \`deploy=NA\` when nothing was merged, or when the repo has no deployment to verify, e.g. a docs/CLI/npm-package repo). Emit one trailer line for every PR you reviewed this run.
+
+OPTIONAL — deliberate hold: if you merged a PR but are INTENTIONALLY leaving the issue at \`pr under review\` (e.g. an acceptance criterion cannot be observed yet), append \`hold=<short-reason-slug>\` to that PR's trailer line:
+
+FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS hold=criterion-not-observable-until-0300z
+
+Use it ONLY for a decision you actually made. It tells the Foreman the label is missing ON PURPOSE, so it will neither auto-set the label nor auto-re-verify behind you — the issue stays visible as a held item instead of being reported as a failure. Omit the field entirely for the normal case; omitting it means "I finished the labeling."
+
+Note: the Foreman now reconciles the outcome label from this trailer as a BACKSTOP — if you merged and did not label, it applies the label your trailer implies. That is a safety net, not a substitute: still set the labels yourself per the skill, because only you can file the follow-ups and post the review body that go with them.
 
 The trailer is MANDATORY and is the last thing you emit. A run that ends without either a \`FOREMAN_REVIEW pr=…\` line or \`FOREMAN_REVIEW none\` is recorded as a FAILED review regardless of how much work you did, because from the outside it is indistinguishable from a session that died mid-merge.
 

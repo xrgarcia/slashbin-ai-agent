@@ -1051,6 +1051,53 @@ export function findIssuesStillUnderReview(
 }
 
 /**
+ * Move an issue out of `pr under review` into the outcome label its own review
+ * run reported, immediately after that run — the deterministic write that closes
+ * the gap this whole lifecycle used to leave open.
+ *
+ * Why this exists at all: the merge is performed by code, but the record of what
+ * the merge MEANT was left to the review agent to remember to write. Measured over
+ * 7 days (2026-07-29 → 08-04): 53 merges, 12 issues left mislabeled — ~23%. In the
+ * worked example (slashbin-io-worker#575) the agent merged, verified, reported
+ * `verdict=APPROVE merged=yes deploy=SUCCESS`, named the target label 24 times in
+ * its own output, and never executed the write. The Foreman parsed that trailer,
+ * logged it, and did nothing with it.
+ *
+ * Sibling of `resolveDeadZone`, which repairs the same state a cycle later from a
+ * FRESH verification. This one is the first line of defense and needs no
+ * re-verification because the verdict is the one the review just produced. Kept
+ * separate rather than merged with it: the two differ in where their verdict comes
+ * from, and that provenance is exactly what a reader needs to trust either one.
+ *
+ * Never applies `ready for prod release` — that label is the EM outcome-gate's
+ * signature and stays a human act (separation of duties, 2026-07-27).
+ */
+export function transitionReviewOutcomeLabel(
+  config: RepoConfig,
+  issueNumber: number,
+  nextLabel: "pr approved" | "pr pending actions",
+  logger: Logger,
+): boolean {
+  try {
+    gh([
+      "issue", "edit", String(issueNumber),
+      "--repo", config.githubRepo,
+      "--remove-label", "pr under review",
+      "--add-label", nextLabel,
+    ], config.repoPath);
+    logger.info(
+      `Reconciled outcome label on #${issueNumber}: "pr under review" → "${nextLabel}" (from the review run's own trailer)`,
+    );
+    return true;
+  } catch (err) {
+    logger.warn(
+      `Failed to reconcile outcome label on #${issueNumber}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+/**
  * Move a dead-zoned issue out of `pr under review` once a FRESH verification has
  * produced a verdict: `pr approved` on PASS, `pr pending actions` on FAIL.
  *
