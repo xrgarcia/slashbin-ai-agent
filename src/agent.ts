@@ -392,18 +392,39 @@ function spawnClaude(
   );
 }
 
+/** How much of a run's final summary is kept for logging and Discord display. */
+export const SUMMARY_DISPLAY_LIMIT = 2000;
+
 /**
  * Parse the final `result` event from a stream-json transcript and return its
- * text (truncated). Falls back to undefined when no result event is present.
+ * text IN FULL. Undefined when no result event is present.
+ *
+ * This used to `.slice(0, 2000)` before returning, which silently destroyed the
+ * outcome it was feeding. The review prompt requires the FOREMAN_REVIEW trailer to
+ * be the last thing the agent emits, so on any review whose summary exceeds 2000
+ * characters the trailer sat past the cut. The caller then parsed the truncated
+ * string, found no trailer, and — because `summary` was non-null, so the
+ * `?? result.stdout` fallback never fired — recorded a complete, correct review as
+ * "ended without declaring an outcome".
+ *
+ * Worked example, slashbin-io-worker PR #589 (2026-08-05): full result text 3,672
+ * chars, trailer at index 3,571, present in the full text and absent from the
+ * truncated one. The agent had complied exactly; the harness threw the answer away
+ * and the run was booked as FAILED.
+ *
+ * The truncation is a DISPLAY concern and now belongs at the display sites
+ * (`SUMMARY_DISPLAY_LIMIT`), never between the agent's answer and the code that
+ * reads it. Note this failure was biased toward the reviews that did the most
+ * work: the longer and more thorough the write-up, the likelier its trailer fell
+ * past the cut.
  */
-function extractStreamResult(stdout: string): string | undefined {
+export function extractStreamResult(stdout: string): string | undefined {
   const lines = stdout.split("\n").filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const evt = JSON.parse(lines[i]);
       if (evt && evt.type === "result") {
-        const text = typeof evt.result === "string" ? evt.result : JSON.stringify(evt);
-        return text.slice(0, 2000);
+        return typeof evt.result === "string" ? evt.result : JSON.stringify(evt);
       }
     } catch {
       // not a JSON line — keep scanning
@@ -761,7 +782,11 @@ ${IMAGE_HANDLING_INSTRUCTIONS}`;
     return { success: false, error };
   }
 
-  const summary = extractStreamResult(result.stdout);
+  // Parse from the FULL result text; truncate only for display. The trailer is
+  // required to be the LAST thing the agent emits, so parsing a length-capped
+  // copy discards exactly the part that carries the outcome.
+  const fullResult = extractStreamResult(result.stdout);
+  const summary = fullResult?.slice(0, SUMMARY_DISPLAY_LIMIT);
 
   // Read the VERDICT out of the agent's final result text, not raw stdout.
   // `result.stdout` is the stream-json transcript, and it opens with the prompt
@@ -774,8 +799,8 @@ ${IMAGE_HANDLING_INSTRUCTIONS}`;
   // `pr=#<number>` and the pattern demands `\d+` — but that is a coincidence of
   // the placeholder, not a guarantee. Prefer the result text; fall back to
   // stdout only when no result event was emitted at all.
-  const trailers = parseReviewTrailerRecords(summary ?? result.stdout);
-  const declaredNoOp = summary ? REVIEW_NOOP_SENTINEL.test(summary) : false;
+  const trailers = parseReviewTrailerRecords(fullResult ?? result.stdout);
+  const declaredNoOp = fullResult ? REVIEW_NOOP_SENTINEL.test(fullResult) : false;
   const statusLine = formatReviewTrailers(trailers);
 
   // --- Trailer gate ------------------------------------------------------

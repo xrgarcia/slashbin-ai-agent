@@ -125,3 +125,53 @@ test("label mapping never yields the production authorization", () => {
   );
   assert.equal(combos.includes("ready for prod release"), false);
 });
+
+// --- Result extraction --------------------------------------------------
+// Regression guard for the defect that made "no trailer emitted" a lie:
+// extractStreamResult used to return text.slice(0, 2000), and the trailer is
+// required to be the LAST thing the agent emits. Any review with a summary over
+// 2000 chars had its outcome silently cut off, and the caller reported a
+// complete review as having declared nothing. Real case: slashbin-io-worker
+// PR #589 — 3,672-char result, trailer at index 3,571.
+import { extractStreamResult, SUMMARY_DISPLAY_LIMIT } from "../dist/agent.js";
+
+const streamLine = (resultText) =>
+  JSON.stringify({ type: "result", result: resultText, uuid: "x" });
+
+test("extractStreamResult returns the FULL result text, not a truncated copy", () => {
+  const trailer = "FOREMAN_REVIEW pr=#589 verdict=APPROVE merged=yes deploy=SUCCESS";
+  const long = "x".repeat(3500) + "\n\n" + trailer;
+  const out = extractStreamResult(streamLine(long));
+  assert.equal(out.length, long.length, "must not truncate");
+  assert.ok(out.endsWith(trailer));
+});
+
+test("a trailer beyond the display limit still parses", () => {
+  const trailer = "FOREMAN_REVIEW pr=#589 verdict=APPROVE merged=yes deploy=SUCCESS hold=cleanup-not-due-until-0300z";
+  const long = "y".repeat(SUMMARY_DISPLAY_LIMIT + 1500) + "\n\n" + trailer;
+  const full = extractStreamResult(streamLine(long));
+
+  // What the old code did, reproduced to prove the bug is what we think it is.
+  assert.equal(parseReviewTrailerRecords(full.slice(0, SUMMARY_DISPLAY_LIMIT)).length, 0);
+
+  // What the fixed path does.
+  const parsed = parseReviewTrailerRecords(full);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].pr, 589);
+  assert.equal(parsed[0].hold, "cleanup-not-due-until-0300z");
+});
+
+test("extractStreamResult picks the LAST result event and tolerates non-JSON lines", () => {
+  const stdout = [
+    "not json at all",
+    streamLine("first"),
+    "{broken",
+    streamLine("FOREMAN_REVIEW pr=#7 verdict=APPROVE merged=yes deploy=NA"),
+  ].join("\n");
+  const out = extractStreamResult(stdout);
+  assert.equal(parseReviewTrailerRecords(out)[0].pr, 7);
+});
+
+test("no result event => undefined, so the caller can fall back to stdout", () => {
+  assert.equal(extractStreamResult("no json here\n{also not}"), undefined);
+});
