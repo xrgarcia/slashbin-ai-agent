@@ -76,3 +76,72 @@ test("multiple revoked gates in one run are all restored", () => {
     { number: 227, dropPrApproved: false },
   ]);
 });
+
+// --- Timeline-based revocation detection -----------------------------------
+//
+// The first version of this guard snapshotted which issues held the gate BEFORE
+// a review run and restored those. It shipped, and then failed on the exact
+// scenario the bug report described. Slashbin-io-docs#269:
+//
+//   13:52:25Z  review run triggered   -> snapshot taken, gate not yet applied
+//   13:57:41Z  EM signs the gate      -> invisible to the snapshot
+//   13:58:20Z  review agent removes it
+//   13:58:xx   guard restores nothing, because its snapshot was empty
+//
+// The rule below is time-symmetric: it asks whether the label was taken away
+// during the window, never whether it existed before the window.
+import { wasGateRevokedSince } from "../dist/github.js";
+
+const RUN_START = Date.parse("2026-08-06T13:52:25Z");
+const ev = (event, name, at) => ({ event, label: { name }, created_at: at });
+
+test("gate signed DURING the run and then removed is detected", () => {
+  // The case the previous guard missed entirely.
+  const events = [
+    ev("labeled", EM_GATE_LABEL, "2026-08-06T13:57:41Z"),
+    ev("unlabeled", EM_GATE_LABEL, "2026-08-06T13:58:20Z"),
+  ];
+  assert.equal(wasGateRevokedSince(events, RUN_START), true);
+});
+
+test("gate that existed before the run and was removed during it is detected", () => {
+  const events = [
+    ev("labeled", EM_GATE_LABEL, "2026-08-06T13:00:00Z"),
+    ev("unlabeled", EM_GATE_LABEL, "2026-08-06T13:58:20Z"),
+  ];
+  assert.equal(wasGateRevokedSince(events, RUN_START), true);
+});
+
+test("a removal BEFORE the run is not this run's doing", () => {
+  // Usually stripReadyForProd on an earlier promotion. Not ours to undo.
+  const events = [ev("unlabeled", EM_GATE_LABEL, "2026-08-06T11:00:00Z")];
+  assert.equal(wasGateRevokedSince(events, RUN_START), false);
+});
+
+test("removing a DIFFERENT label is not a revocation", () => {
+  const events = [
+    ev("unlabeled", "pr under review", "2026-08-06T13:58:20Z"),
+    ev("unlabeled", "approved", "2026-08-06T13:58:20Z"),
+  ];
+  assert.equal(wasGateRevokedSince(events, RUN_START), false);
+});
+
+test("APPLYING the gate during the run is not a revocation", () => {
+  const events = [ev("labeled", EM_GATE_LABEL, "2026-08-06T13:57:41Z")];
+  assert.equal(wasGateRevokedSince(events, RUN_START), false);
+});
+
+test("an empty or unparseable timeline restores nothing", () => {
+  assert.equal(wasGateRevokedSince([], RUN_START), false);
+  assert.equal(wasGateRevokedSince([{ event: "unlabeled" }], RUN_START), false);
+  assert.equal(
+    wasGateRevokedSince([ev("unlabeled", EM_GATE_LABEL, "not-a-date")], RUN_START),
+    false,
+    "an unparseable timestamp must not manufacture a restore",
+  );
+});
+
+test("a removal exactly at the run start counts — the boundary is inclusive", () => {
+  const events = [ev("unlabeled", EM_GATE_LABEL, "2026-08-06T13:52:25Z")];
+  assert.equal(wasGateRevokedSince(events, RUN_START), true);
+});

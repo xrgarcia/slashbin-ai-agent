@@ -33,7 +33,7 @@ import {
   findIssuesStillUnderReview,
   resolveDeadZone,
   transitionReviewOutcomeLabel,
-  snapshotEmGate,
+  findRevokedEmGates,
   restoreEmGate,
   findOrphanedLifecycleIssues,
   releaseOrphanedLifecycle,
@@ -1177,13 +1177,12 @@ async function tryReview(
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const transcriptPath = resolve(process.cwd(), "logs", "review", `${repoName}-cycle${cycleNumber}-${ts}.log`);
 
-  // Snapshot the EM outcome-gate BEFORE the run. `findPRsNeedingReview` already
-  // excludes advanced issues, but it decided that minutes ago; a gate signed
-  // while this run is in flight is invisible to it and gets overwritten by the
-  // run's own label write. Restored in `finally`, so a crash cannot strand it.
-  const gatedBeforeReview = snapshotEmGate(
-    repoConfig.githubRepo, repoConfig.repoPath, candidate.issueNumbers, reviewLogger,
-  );
+  // Mark when this run starts. Any removal of the EM outcome-gate label after
+  // this instant is the run's doing — whether the gate existed beforehand or was
+  // signed while the run was in flight. The second case is the common one,
+  // because the EM signs dev acceptance during the minutes a review takes, and
+  // it is precisely the case a pre-run snapshot cannot see.
+  const reviewStartedAt = new Date().toISOString();
 
   const runAbort = new AbortController();
   activeRuns.set(repoName, runAbort);
@@ -1270,7 +1269,22 @@ async function tryReview(
 
     // Undo any revocation of the EM outcome-gate. In `finally` on purpose: a run
     // that threw or was aborted may still have written labels before it died.
-    const restored = restoreEmGate(repoConfig, gatedBeforeReview, reviewLogger);
+    //
+    // `stripReadyForProd` removes this label legitimately once a promotion PR
+    // takes ownership. When one is open the label is SUPPOSED to be gone, and
+    // restoring it would fight the promotion path — so that case is checked
+    // before any write, and only when something actually looks revoked.
+    const revoked = findRevokedEmGates(
+      repoConfig, candidate.issueNumbers, reviewStartedAt, reviewLogger,
+    );
+    const promotionOwnsIt = revoked.length > 0 &&
+      !!findOpenPromotionPR(repoConfig.githubRepo, "main", repoConfig.repoPath, reviewLogger);
+    if (promotionOwnsIt) {
+      reviewLogger.info(
+        `"${EM_GATE_LABEL}" left removed on #${revoked.join(", #")} — an open promotion PR owns it now.`,
+      );
+    }
+    const restored = promotionOwnsIt ? [] : restoreEmGate(repoConfig, revoked, reviewLogger);
     if (restored.length > 0) {
       events?.push({
         message: `⚠️ ${repoConfig.githubRepo} — the review run removed "${EM_GATE_LABEL}" from issue(s) ${restored.map((n) => `#${n}`).join(", ")}; restored. Promotion would otherwise have stalled silently.`,

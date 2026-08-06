@@ -1250,36 +1250,87 @@ export function transitionReviewOutcomeLabel(
  */
 export const EM_GATE_LABEL = "ready for prod release";
 
+export interface TimelineLabelEvent {
+  event?: string;
+  label?: { name?: string };
+  created_at?: string;
+}
+
 /**
- * Which of `issueNumbers` currently carry the EM outcome-gate label.
+ * Did the EM outcome-gate label get REMOVED at or after `sinceMs`?
  *
- * Taken as a snapshot BEFORE a review run so the same set can be checked after
- * it. `findPRsNeedingReview` already excludes issues that have advanced — but it
- * evaluates that at TRIGGER time, and a review run lasts minutes. An EM gate
- * signed while the run is in flight passes the trigger check and is then
- * overwritten by the run's own label write.
- *
- * Returns [] on any failure, which means "restore nothing" — a lookup that fails
- * must never manufacture a label that was not there.
+ * Pure, so the rule can be tested without a network. The rule that matters is
+ * time-symmetry: this asks "was it taken away during the window", never "did it
+ * exist before the window". The previous guard asked the second question and
+ * therefore missed every gate signed while a review was already running — which
+ * is the normal case, not the edge case.
  */
-export function snapshotEmGate(
-  repo: string,
-  cwd: string,
+export function wasGateRevokedSince(events: TimelineLabelEvent[], sinceMs: number): boolean {
+  return events.some((e) =>
+    e.event === "unlabeled" &&
+    e.label?.name === EM_GATE_LABEL &&
+    typeof e.created_at === "string" &&
+    Number.isFinite(Date.parse(e.created_at)) &&
+    Date.parse(e.created_at) >= sinceMs,
+  );
+}
+
+/**
+ * Which of `issueNumbers` had the EM outcome-gate label REMOVED since `sinceIso`.
+ *
+ * Detected from the issue's own label timeline, not from a snapshot taken before
+ * the run. That distinction is the entire point, and the first version of this
+ * guard got it wrong: it captured which issues held the gate BEFORE the review
+ * started, then restored those. That handles a gate signed before the run and
+ * completely misses a gate signed DURING it — which is the actual reported
+ * scenario, and the one that recurred on Slashbin-io-docs#269 (review triggered
+ * 13:52:25Z, gate signed 13:57:41Z, agent removed it 13:58:20Z, guard restored
+ * nothing because its snapshot predated the signature).
+ *
+ * Reading the timeline is time-symmetric: an `unlabeled` event inside the run
+ * window is a revocation regardless of when the label was applied.
+ *
+ * Only consulted for issues that do NOT currently carry the label, so the healthy
+ * path costs nothing beyond the open-issue snapshot already in hand. Returns []
+ * on any failure — a lookup that fails must never manufacture authorization.
+ */
+export function findRevokedEmGates(
+  config: RepoConfig,
   issueNumbers: number[],
+  sinceIso: string,
   logger: Logger,
 ): number[] {
   if (issueNumbers.length === 0) return [];
+  const since = Date.parse(sinceIso);
+  if (Number.isNaN(since)) return [];
+
+  const revoked: number[] = [];
   try {
-    dropIssueSnapshot(repo);
-    const open = getOpenIssues(repo, cwd, logger);
-    return issueNumbers.filter((num) => {
+    dropIssueSnapshot(config.githubRepo);
+    const open = getOpenIssues(config.githubRepo, config.repoPath, logger);
+
+    for (const num of issueNumbers) {
       const issue = open.find((i) => i.number === num);
-      return issue ? hasLabel(issue, EM_GATE_LABEL) : false;
-    });
+      // Closed, or the gate is still there — nothing was revoked.
+      if (!issue || hasLabel(issue, EM_GATE_LABEL)) continue;
+
+      try {
+        const raw = gh([
+          "api", `repos/${config.githubRepo}/issues/${num}/timeline?per_page=100`,
+          "-H", "Accept: application/vnd.github.mockingbird-preview+json",
+        ], config.repoPath);
+        const events: TimelineLabelEvent[] = JSON.parse(raw || "[]");
+        if (wasGateRevokedSince(events, since)) revoked.push(num);
+      } catch (err) {
+        logger.warn(
+          `Could not read the label timeline for #${num}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   } catch (err) {
-    logger.warn(`snapshotEmGate failed for ${repo}: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    logger.warn(`findRevokedEmGates failed for ${config.githubRepo}: ${err instanceof Error ? err.message : String(err)}`);
   }
+  return revoked;
 }
 
 export interface EmGateRestoreStep {
