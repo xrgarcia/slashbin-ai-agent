@@ -128,6 +128,18 @@ For a single repo, set fields at the root level:
 | `logFormat` | `AI_AGENT_LOG_FORMAT` | `text` | `json` or `text` |
 | `logLevel` | `AI_AGENT_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
+### Variables the daemon SETS on its own sessions
+
+These are outputs, not config — the daemon exports them into every Claude session it spawns. Nothing reads them from your config, and setting them yourself has no effect on the daemon.
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `SLASHBIN_AGENT` | `foreman` | Marks the session as agent-driven rather than human-driven. |
+
+**Why it exists.** The review phase runs under the operator's GitHub token, so everything it does is attributed to that account. Without a marker, a `PreToolUse` hook cannot tell an agent's session from a human's — and every session is spawned with `--dangerously-skip-permissions`, so hooks are the only remaining control. On 2026-08-12 one cycle in our own deployment filed an issue, applied the trigger label to it, implemented, reviewed and merged it — a complete self-authorization loop in about fourteen minutes, recorded in the audit trail as the operator's work. The change happened to be correct; nothing structural had prevented it.
+
+**How to use it.** If you gate your trigger label with a hook, refuse the label when `SLASHBIN_AGENT` is set. The agent can still file issues — that is often the most valuable thing it does — but it cannot grant itself authorization to build them. If you do not run such a hook, the variable is simply present and unread; behaviour is unchanged.
+
 ### GitHub API budget
 
 Each poll cycle spends **one GraphQL request per repo** for issue discovery. GitHub's GraphQL limit is **5,000 requests/hour per token**, so the discovery floor is:
