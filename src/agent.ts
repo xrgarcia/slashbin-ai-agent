@@ -295,6 +295,24 @@ function spawnClaudeWithOptions(
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
   if (opts.ghToken) env.GH_TOKEN = opts.ghToken;
 
+  /**
+   * Mark every session this daemon starts as agent-driven.
+   *
+   * The review phase runs in the EM repo under the EM token, so anything it does
+   * on GitHub is attributed to the EM. On 2026-08-12 that let one cycle file an
+   * issue, apply `approved` to it, implement it, review it and merge it — a
+   * complete self-authorization loop that the audit trail recorded as the EM's
+   * work. The change was correct; nothing structural had prevented it.
+   *
+   * `approved` is a flight authorization, and an agent must not grant itself
+   * one. Hooks are the only control left here because every session is spawned
+   * with --dangerously-skip-permissions, and a hook cannot tell whose session it
+   * is running in unless the environment says so. This is that signal. It is
+   * purely additive: a fork that does not run those hooks simply carries an
+   * unread variable. Documented in README.md.
+   */
+  env.SLASHBIN_AGENT = "foreman";
+
   return new Promise<SpawnResult>((resolve) => {
     let stdout = "";
     let stderr = "";
