@@ -58,9 +58,7 @@ The Foreman is one layer in an AI engineering pipeline:
 4. **Reviewers** (human or AI) provide feedback on PRs — Foreman revises automatically
 5. **Foreman** promotes merged work from develop → main via promotion PRs
 
-The Foreman uses a **dual-token model**: one GitHub token for its own operations (creating PRs, managing labels) and a second token for the Engineering Manager (approving and merging PRs that require branch protection). This satisfies branch protection, which requires the approving identity to differ from the PR author.
-
-> **The dual-token model is not, on its own, a guard against self-approval.** This paragraph used to claim it was. It is not: the review phase runs *under the EM token*, so anything it does there is both permitted and attributed to the EM. On 2026-08-12 one cycle in our own deployment used that token to file an issue, apply the trigger label to it, implement, review and merge it — a complete loop in about fourteen minutes, recorded as the operator's work. Two tokens separate *identities*; they do not separate *authority* when one process holds both. If self-approval matters to you, gate the trigger label on [`SLASHBIN_AGENT`](#variables-the-daemon-sets-on-its-own-sessions).
+The Foreman uses a **dual-token model**: one GitHub token for its own operations (creating PRs, managing labels) and a second token for the Engineering Manager (approving and merging PRs that require branch protection). This prevents the Foreman from self-approving its own work.
 
 This is the pattern behind [www.slashbin.io](https://www.slashbin.io?utm_source=github&utm_medium=readme&utm_campaign=ai-foreman_body) — structured context in, autonomous execution out. The Foreman doesn't need to understand your business. It reads the issue, reads the repo's CLAUDE.md, and invokes the skill.
 
@@ -222,7 +220,7 @@ Set these environment variables to enable status updates in Discord. The Foreman
 | Env Var | Description |
 |---|---|
 | `FOREMAN_GITHUB_TOKEN` | Token for Foreman operations (create PRs, manage labels) |
-| `EM_GITHUB_TOKEN` | Token for Engineering Manager operations (approve/merge PRs behind branch protection). **The review phase runs under this token**, so issues it files and labels it applies are attributed to the EM — see the note on self-approval above. |
+| `EM_GITHUB_TOKEN` | Token for Engineering Manager operations (approve/merge PRs behind branch protection) |
 
 ### Prompt template variables
 
