@@ -2034,6 +2034,124 @@ export function tryMergeSyncPR(
   }
 }
 
+// --- Dependency PRs (Dependabot) ---
+
+/**
+ * Open Dependabot PRs into `base`, and nothing else.
+ *
+ * Dependabot PRs never carry a linked issue, so the review phase cannot see
+ * them: it is scoped to `features → develop` PRs and every step after the merge
+ * (labelling, follow-up filing, the outcome trailer) is expressed in terms of an
+ * issue. Rather than widen the skill that reviews and merges ALL feature work —
+ * the highest-blast-radius thing here — these get their own mechanical path,
+ * shaped exactly like the `main → develop` sync merge above: a narrow rule, no
+ * agent, no issue.
+ *
+ * **The head-branch test is the safety property, not the label.** Dependabot
+ * labels its PRs `dependencies` by default, but a label is something any account
+ * can apply; `dependabot/*` is a branch only Dependabot writes. Selecting on the
+ * branch means a mislabelled human PR can never be swept into an unreviewed
+ * merge.
+ */
+export function findDependencyPRs(
+  repo: string,
+  cwd: string,
+  base: string,
+  logger?: Logger,
+): PrSnapshot[] {
+  try {
+    return getOpenPrs(repo, cwd).filter(
+      (p) => p.baseRefName === base && p.headRefName.startsWith("dependabot/"),
+    );
+  } catch (err) {
+    logger?.warn("findDependencyPRs: gh pr list failed", { ...formatGhError(err), repo, base });
+    return [];
+  }
+}
+
+/**
+ * Merge one Dependabot PR, but only once every check has CONCLUDED successfully.
+ *
+ * Deliberately stricter than `tryMergeSyncPR`, which merges whatever branch
+ * protection permits. A sync PR carries content that is already on `main` — it
+ * has been reviewed and deployed. A dependency bump has been reviewed by nobody,
+ * so the build and test suite are the entire review, and a merge while they are
+ * still running would be a merge on no evidence at all.
+ *
+ * The gate therefore refuses on ANY check that is not a concluded success:
+ * pending, queued, failed and cancelled all mean "not yet proven". `SKIPPED` and
+ * `NEUTRAL` pass, because a skipped job made no claim either way.
+ *
+ * Returns false and stays quiet on anything unmergeable, so the caller can retry
+ * every cycle without noise — the same idempotent-retry shape as the sync path.
+ */
+export function tryMergeDependencyPR(
+  repo: string,
+  prNumber: number,
+  cwd: string,
+  logger?: Logger,
+): boolean {
+  interface CheckRun { status?: string; conclusion?: string; name?: string }
+  let view: { mergeable?: string; baseRefName?: string; headRefName?: string; statusCheckRollup?: CheckRun[] };
+  try {
+    view = JSON.parse(
+      gh([
+        "pr", "view", String(prNumber),
+        "--repo", repo,
+        "--json", "mergeable,baseRefName,headRefName,statusCheckRollup",
+      ], cwd) || "{}",
+    );
+  } catch (err) {
+    logger?.debug(`Dependency PR #${prNumber}: could not read state: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+
+  // Re-assert both invariants against the PR itself rather than trusting the
+  // list that selected it. A base that is not the development branch is the one
+  // outcome this must never produce.
+  if (!view.headRefName?.startsWith("dependabot/")) {
+    logger?.warn(`Dependency PR #${prNumber} is not a dependabot branch (${view.headRefName}) — refusing`);
+    return false;
+  }
+
+  const checks = view.statusCheckRollup ?? [];
+  const unfinished = checks.filter((c) => (c.status ?? "").toUpperCase() !== "COMPLETED");
+  if (unfinished.length > 0) {
+    logger?.debug(`Dependency PR #${prNumber}: ${unfinished.length} check(s) still running`);
+    return false;
+  }
+  const passing = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
+  const failed = checks.filter((c) => !passing.has((c.conclusion ?? "").toUpperCase()));
+  if (failed.length > 0) {
+    logger?.info(
+      `Dependency PR #${prNumber} has failing check(s): ${failed.map((c) => `${c.name}=${c.conclusion}`).join(", ")} — leaving it open for a human`,
+    );
+    return false;
+  }
+  if (checks.length === 0) {
+    logger?.info(`Dependency PR #${prNumber} has no checks at all — refusing to merge on no evidence`);
+    return false;
+  }
+
+  try {
+    try {
+      ghAsEM([
+        "pr", "review", String(prNumber),
+        "--repo", repo,
+        "--approve",
+        "--body", `Automated dependency update — every check concluded successfully (${checks.length} check(s)). Merged to \`${view.baseRefName}\` by the Foreman; it reaches production only through the normal promotion gate.`,
+      ], cwd);
+    } catch {
+      // Already approved, or approval not required.
+    }
+    ghAsEM(["pr", "merge", String(prNumber), "--repo", repo, "--merge"], cwd);
+    return true;
+  } catch (err) {
+    logger?.debug(`Dependency PR #${prNumber} not mergeable yet: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
 // --- PR Verification ---
 
 export function verifyPRExists(

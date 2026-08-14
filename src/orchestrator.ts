@@ -18,6 +18,8 @@ import {
   checkBranchDrift,
   findOpenSyncPR,
   createSyncPR,
+  findDependencyPRs,
+  tryMergeDependencyPR,
   tryMergeSyncPR,
   countBranchDiffFiles,
   stripReadyForProdLabel,
@@ -607,6 +609,22 @@ async function runRepoCycle(
   if (!(repoConfig.baseBranch === "main" && repoConfig.featureBranch === "main")) {
     if (trySyncDrift(repoConfig, base, cycleNumber)) {
       events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged`, level: "info" });
+      processed++;
+    }
+  }
+
+  // --- Phase 4b: Merge Dependabot PRs into the development branch once their
+  //    checks are green. They carry no linked issue, so the review phase cannot
+  //    see them and they accumulate against the base branch forever — 8 open
+  //    across the two jerky repos when this was added. Mechanical, like the sync
+  //    merge above: the build and test suite are the whole review. ---
+  if (repoConfig.baseBranch !== "main") {
+    const merged = tryDependencyMerges(repoConfig, base, cycleNumber);
+    if (merged > 0) {
+      events.push({
+        message: `${repoConfig.githubRepo}: merged ${merged} dependency PR(s) into ${repoConfig.baseBranch}`,
+        level: "info",
+      });
       processed++;
     }
   }
@@ -1331,6 +1349,45 @@ function trySyncDrift(
   }
   syncLogger.warn("Failed to create sync PR");
   return false;
+}
+
+/**
+ * Merge every green Dependabot PR into the repo's development branch.
+ *
+ * Guarded to `baseBranch !== "main"` by the caller, and again inside
+ * `tryMergeDependencyPR`: a dependency update must never be merged straight to
+ * a production branch, which is the exact defect `jerky_shipping#237` exists to
+ * close on the producing side. This is the consuming side — it only ever acts on
+ * PRs already aimed at development.
+ *
+ * Returns how many merged, so a quiet cycle stays quiet.
+ */
+function tryDependencyMerges(
+  repoConfig: RepoConfig,
+  logger: Logger,
+  cycleNumber: number,
+): number {
+  const depLogger = logger.child({ cycle: cycleNumber, repo: repoConfig.name, phase: "dependencies" });
+
+  const prs = findDependencyPRs(
+    repoConfig.githubRepo,
+    repoConfig.repoPath,
+    repoConfig.baseBranch,
+    depLogger,
+  );
+  if (prs.length === 0) return 0;
+
+  let merged = 0;
+  for (const pr of prs) {
+    if (tryMergeDependencyPR(repoConfig.githubRepo, pr.number, repoConfig.repoPath, depLogger)) {
+      depLogger.info(`Dependency PR merged — #${pr.number}: ${pr.title}`);
+      merged++;
+    }
+  }
+  if (merged === 0) {
+    depLogger.debug(`${prs.length} dependency PR(s) open, none mergeable this cycle`);
+  }
+  return merged;
 }
 
 function tryPromotion(
