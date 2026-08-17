@@ -66,6 +66,11 @@ const configSchema = z.object({
   issueSnapshotLimit: z.coerce.number().int().positive().default(500),
   maxTurns: z.coerce.number().int().positive().default(30),
   maxDurationMs: z.coerce.number().int().positive().default(1_800_000),
+  // Model for the implement/revise phases, cascading to every repo that does not
+  // set its own. Omit to let the Claude CLI pick its default. Global because the
+  // model is a spend/quality dial for the whole fleet, not a per-repo trait —
+  // without the cascade the only way to move the fleet is to edit all 20 entries.
+  model: z.string().optional(),
   allowedTools: z.array(z.string()).default(["Read", "Write", "Edit", "Bash", "Glob", "Grep"]),
   logFormat: z.enum(["json", "text"]).default("text"),
   logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -228,6 +233,7 @@ export function loadConfig(configPath?: string): AgentConfig {
     featureBranch: process.env.AI_AGENT_FEATURE_BRANCH ?? fileConfig.featureBranch,
     maxTurns: process.env.AI_AGENT_MAX_TURNS ?? fileConfig.maxTurns,
     maxDurationMs: process.env.AI_AGENT_MAX_DURATION_MS ?? fileConfig.maxDurationMs,
+    model: process.env.AI_AGENT_MODEL ?? fileConfig.model,
     allowedTools: fileConfig.allowedTools,
     logFormat: process.env.AI_AGENT_LOG_FORMAT ?? fileConfig.logFormat,
     logLevel: process.env.AI_AGENT_LOG_LEVEL ?? fileConfig.logLevel,
@@ -282,7 +288,7 @@ export function loadConfig(configPath?: string): AgentConfig {
         skillPath: entry.skillPath,
         revisionSkillPath: entry.revisionSkillPath,
         prompt: entry.prompt,
-        model: entry.model,
+        model: entry.model ?? parsed.model,
         maxTurns: entry.maxTurns ?? parsed.maxTurns,
         maxDurationMs: entry.maxDurationMs ?? parsed.maxDurationMs,
         reviewEnabled: entry.reviewEnabled ?? parsed.reviewEnabled,
@@ -311,6 +317,7 @@ export function loadConfig(configPath?: string): AgentConfig {
       skillPath: parsed.skillPath,
       revisionSkillPath: parsed.revisionSkillPath,
       prompt: parsed.prompt,
+      model: parsed.model,
       maxTurns: parsed.maxTurns,
       maxDurationMs: parsed.maxDurationMs,
       reviewEnabled: parsed.reviewEnabled,

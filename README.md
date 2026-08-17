@@ -124,6 +124,7 @@ For a single repo, set fields at the root level:
 | `featureBranch` | `AI_AGENT_FEATURE_BRANCH` | `features` | Branch to commit to |
 | `maxTurns` | `AI_AGENT_MAX_TURNS` | `30` | Max agent turns per issue |
 | `maxDurationMs` | `AI_AGENT_MAX_DURATION_MS` | `1800000` (30 min) | Max implementation time |
+| `model` | `AI_AGENT_MODEL` | CLI default | Model for implement/revise. Cascades to every repo that sets no `model` of its own |
 | `allowedTools` | — | `["Read","Write","Edit","Bash","Glob","Grep"]` | Tools the CLI can use |
 | `logFormat` | `AI_AGENT_LOG_FORMAT` | `text` | `json` or `text` |
 | `logLevel` | `AI_AGENT_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -315,7 +316,7 @@ Review config keys (all optional; global, with a per-repo `reviewEnabled` overri
 | `reviewEnabled` | `false` | Enable the Review phase (per-repo override supported) |
 | `emRepoPath` | — | Working dir for the review skill (the review repo). Required when enabled |
 | `reviewSkillPath` | `.claude/skills/review-all-prs/SKILL.md` | Review skill, relative to `emRepoPath` |
-| `reviewModel` | — | Model override for review runs |
+| `reviewModel` | — | Model override for review runs (independent of `model`) |
 | `reviewMaxTurns` | `200` | Max turns (review + verify is long-running) |
 | `reviewMaxDurationMs` | `3600000` (60 min) | Max review duration |
 | `reviewAllowedTools` | broad MCP + shell set | Tool surface for the review skill |
