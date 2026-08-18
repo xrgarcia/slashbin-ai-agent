@@ -41,6 +41,14 @@ export interface RepoState {
   // deliberate decision must not be rubber-stamped by an automated verdict.
   // Optional for backward compat with state files written before this field existed.
   held?: Record<number, HeldIssue>;
+  // Feature branches whose commits were REJECTED — the last PR for the branch was
+  // closed unmerged and the branch has not moved since. The reconciler refuses to
+  // recreate a PR for them, and this records the head SHA it already alerted on so
+  // a standing rejection is announced ONCE rather than every reconcile pass.
+  // Keyed by branch name; the value is the alerted head SHA, so a NEW commit on the
+  // branch (different SHA) is a fresh condition and alerts again.
+  // Optional for backward compat with state files written before this field existed.
+  rejectedBranches?: Record<string, string>;
 }
 
 interface PersistedState {
@@ -102,6 +110,7 @@ export function loadRepoState(repoName: string): RepoState {
       failed: { ...repo.failed },
       skipped: { ...(repo.skipped ?? {}) },
       held: { ...(repo.held ?? {}) },
+      rejectedBranches: { ...(repo.rejectedBranches ?? {}) },
     };
   }
 
@@ -116,6 +125,7 @@ export function loadRepoState(repoName: string): RepoState {
       failed: { ...migrated.failed },
       skipped: { ...(migrated.skipped ?? {}) },
       held: { ...(migrated.held ?? {}) },
+      rejectedBranches: { ...(migrated.rejectedBranches ?? {}) },
     };
   }
 
@@ -124,6 +134,7 @@ export function loadRepoState(repoName: string): RepoState {
     failed: { ...EMPTY_REPO_STATE.failed },
     skipped: {},
     held: {},
+    rejectedBranches: {},
   };
 }
 

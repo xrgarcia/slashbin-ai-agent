@@ -455,6 +455,42 @@ async function runRepoCycle(
       events.push({ message: `Reconciled ${repoConfig.githubRepo} — ${result.commitCount} orphaned commit(s), PR: ${result.prUrl}`, level: "info" });
       processed++;
     }
+
+    // A rejected branch is a STANDING condition, not an event: the commits sit
+    // ahead of base every cycle until someone reverts them. Alert ONCE per head
+    // SHA — same discipline as the dead-zone alerts below, for the same reason
+    // (a per-cycle repeat is indistinguishable from noise and gets muted).
+    //
+    // Deliberately detection-only. The cure is to revert the rejected diff off the
+    // shared branch, and that is a destructive push to a branch other work rides
+    // on — on a protected branch it is not even possible (HTTP 422). Doing it
+    // automatically could discard legitimate unmerged work, so the Foreman reports
+    // and a human decides. See slashbin-ai-foreman#24.
+    for (const r of result.rejected ?? []) {
+      const state = loadRepoState(repoConfig.name);
+      const alreadyAlerted = (state.rejectedBranches ?? {})[r.branch];
+      if (alreadyAlerted === r.headSha) continue;
+
+      const issues = r.issueNumbers.length > 0
+        ? ` (issues ${r.issueNumbers.map((n) => `#${n}`).join(", ")})`
+        : "";
+      reconLogger.warn(
+        `${r.branch} carries ${r.commitCount} rejected commit(s) — PR #${r.prNumber} was closed unmerged ` +
+        `and nothing has changed since. Reconciliation is blocked until the diff is reverted off the branch.`,
+        { branch: r.branch, headSha: r.headSha, rejectedPR: r.prUrl },
+      );
+      events.push({
+        message:
+          `⚠️ ${repoConfig.githubRepo} — \`${r.branch}\` still carries the ${r.commitCount} commit(s) from ` +
+          `PR #${r.prNumber}, which was closed unmerged${issues}. The Foreman will NOT recreate that PR. ` +
+          `Revert the diff off \`${r.branch}\`, or those commits ride along in the next PR from this branch. ${r.prUrl}`,
+        level: "warn",
+      });
+
+      const fresh = loadRepoState(repoConfig.name);
+      fresh.rejectedBranches = { ...(fresh.rejectedBranches ?? {}), [r.branch]: r.headSha };
+      saveRepoState(repoConfig.name, fresh);
+    }
   } catch (err) {
     reconLogger.error("Reconciliation failed", {
       error: err instanceof Error ? err.message : String(err),
