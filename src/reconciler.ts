@@ -25,6 +25,45 @@ function git(args: string[], cwd: string): string {
   }).trim();
 }
 
+/**
+ * What actually went wrong with a `git` child process.
+ *
+ * `err.message` alone is `Command failed: git fetch origin` — true, and useless.
+ * git puts the reason on stderr, which the helper captures and then nobody reads,
+ * so a broken remote, an auth failure and a killed process all produce the same
+ * sentence. Same defect class as the stderr-masking fixed in `ea60c9d`: a message
+ * that reads as a cause and isn't.
+ *
+ * `signal` matters more than it looks. git runs in the service cgroup, so when
+ * systemd stops the unit its SIGTERM reaches the child while the Foreman is still
+ * draining. The fetch didn't fail — it was cancelled — and reporting that as a
+ * WARN sent one investigation at the clone and the remote before the timestamps
+ * ruled both out.
+ */
+interface GitFailure {
+  error: string;
+  stderr?: string;
+  signal?: string;
+  /** Killed by a shutdown signal rather than failing on its own merits. */
+  cancelled: boolean;
+}
+
+function formatGitError(err: unknown): GitFailure {
+  const e = err as { message?: string; stderr?: unknown; signal?: string | null };
+  const stderr = typeof e?.stderr === "string"
+    ? e.stderr.trim()
+    : Buffer.isBuffer(e?.stderr)
+      ? e.stderr.toString("utf-8").trim()
+      : "";
+  const signal = e?.signal ?? undefined;
+  return {
+    error: e?.message ?? String(err),
+    ...(stderr ? { stderr } : {}),
+    ...(signal ? { signal } : {}),
+    cancelled: signal === "SIGTERM" || signal === "SIGINT",
+  };
+}
+
 export interface LocalBranchDivergence {
   ahead: number;
   behind: number;
@@ -190,9 +229,16 @@ export function reconcileRepo(
   try {
     git(["fetch", "origin"], config.repoPath);
   } catch (err) {
-    logger.warn("git fetch failed, skipping reconciliation", {
-      error: err instanceof Error ? err.message : String(err),
-    });
+    const failure = formatGitError(err);
+    if (failure.cancelled) {
+      // Shutdown, not a fault. The next start reconciles this repo normally.
+      logger.info("Reconciliation cancelled — git fetch was interrupted by shutdown", {
+        repo: config.name,
+        signal: failure.signal,
+      });
+    } else {
+      logger.warn("git fetch failed, skipping reconciliation", { repo: config.name, ...failure });
+    }
     return { reconciled: false, issueNumbers: [], commitCount: 0 };
   }
 
