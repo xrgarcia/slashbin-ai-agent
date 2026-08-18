@@ -32,5 +32,14 @@
   "maxTurns": 30,
   "maxDurationMs": 1800000,
   "logFormat": "text",
-  "logLevel": "info"
+  "logLevel": "info",
+
+  "_review_phase": "Optional. Enable the Review phase to auto-review feature PRs. Disabled by default. Requires EM_GITHUB_TOKEN in the environment. Per-repo override: add reviewEnabled to a repos[] entry.",
+  "reviewEnabled": false,
+  "emRepoPath": "../my-review-repo",
+  "reviewSkillPath": ".claude/skills/review-all-prs/SKILL.md",
+  "reviewModel": "claude-opus-4-8",
+  "reviewMaxTurns": 200,
+  "reviewMaxDurationMs": 3600000,
+  "reviewerLogin": "your-reviewer-bot-login"
 }

@@ -9,6 +9,21 @@ interface FailedIssue {
 interface SkippedIssue {
   lastSkippedAt: string; // ISO timestamp
   reason: string;
+  // Consecutive times the agent has skipped this issue. Drives the ESCALATING
+  // back-off (a fixed snooze never gives up, so a permanently-unactionable issue
+  // costs one agent session per window forever — slashbin-ai-foreman#32).
+  // Optional for backward compat with state files written before this field existed;
+  // absent is read as 0, i.e. the original single-window behavior.
+  skipCount?: number;
+}
+
+interface HeldIssue {
+  /** ISO timestamp of the review run that declared the hold. */
+  heldAt: string;
+  /** The PR whose review declared it. */
+  prNumber: number;
+  /** Why the reviewer withheld the outcome label, verbatim from the trailer. */
+  reason: string;
 }
 
 export interface RepoState {
@@ -19,6 +34,21 @@ export interface RepoState {
   // applies a back-off so we don't re-attempt every cycle.
   // Optional for backward compat with v2 state files written before this field existed.
   skipped?: Record<number, SkippedIssue>;
+  // Issues whose reviewer DELIBERATELY withheld the outcome label (trailer
+  // `hold=`), e.g. an acceptance criterion that cannot be observed until a later
+  // time boundary. Distinct from a dropped label: the reviewer reported the hold,
+  // so neither the label reconciler nor dead-zone recovery may overwrite it — a
+  // deliberate decision must not be rubber-stamped by an automated verdict.
+  // Optional for backward compat with state files written before this field existed.
+  held?: Record<number, HeldIssue>;
+  // Feature branches whose commits were REJECTED — the last PR for the branch was
+  // closed unmerged and the branch has not moved since. The reconciler refuses to
+  // recreate a PR for them, and this records the head SHA it already alerted on so
+  // a standing rejection is announced ONCE rather than every reconcile pass.
+  // Keyed by branch name; the value is the alerted head SHA, so a NEW commit on the
+  // branch (different SHA) is a fresh condition and alerts again.
+  // Optional for backward compat with state files written before this field existed.
+  rejectedBranches?: Record<string, string>;
 }
 
 interface PersistedState {
@@ -79,6 +109,8 @@ export function loadRepoState(repoName: string): RepoState {
       implemented: [...repo.implemented],
       failed: { ...repo.failed },
       skipped: { ...(repo.skipped ?? {}) },
+      held: { ...(repo.held ?? {}) },
+      rejectedBranches: { ...(repo.rejectedBranches ?? {}) },
     };
   }
 
@@ -92,6 +124,8 @@ export function loadRepoState(repoName: string): RepoState {
       implemented: [...migrated.implemented],
       failed: { ...migrated.failed },
       skipped: { ...(migrated.skipped ?? {}) },
+      held: { ...(migrated.held ?? {}) },
+      rejectedBranches: { ...(migrated.rejectedBranches ?? {}) },
     };
   }
 
@@ -99,6 +133,8 @@ export function loadRepoState(repoName: string): RepoState {
     implemented: [...EMPTY_REPO_STATE.implemented],
     failed: { ...EMPTY_REPO_STATE.failed },
     skipped: {},
+    held: {},
+    rejectedBranches: {},
   };
 }
 

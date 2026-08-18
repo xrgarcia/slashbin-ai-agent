@@ -1,12 +1,151 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import type { RepoConfig } from "./config.js";
+import { mkdirSync, createWriteStream, type WriteStream } from "node:fs";
+import { dirname, join } from "node:path";
+import type { AgentConfig, RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { verifyPRExists, checkPRHasChanges, getRemoteBranchSha } from "./github.js";
+
+/**
+ * Describe a non-zero exit WITHOUT letting stderr impersonate the root cause.
+ *
+ * The previous form was `stderr || stdoutTail || exitCode`, which put stderr
+ * FIRST. The Claude CLI writes benign startup noise to stderr on every run — an
+ * untrusted-workspace notice, deprecation warnings — so whenever a run failed
+ * for an unrelated reason, that noise became the entire reported error and the
+ * real cause was never recorded anywhere.
+ *
+ * Observed 2026-08-04 on slashbin-io-worker cycle 1519: the run died 12.5
+ * minutes in and was reported as
+ * `Implementation failed: Ignoring 5 permissions.allow entries ...`.
+ * The identical warning appears on cycle 1520, which SUCCEEDED — so it could
+ * not have been the cause, and the actual reason is unrecoverable. Ray brought
+ * that message in as the failure; it was never even a symptom.
+ *
+ * The fix is precedence and labelling, not suppression: lead with the one
+ * unambiguous fact (the exit code), then the agent's own output, then stderr
+ * clearly marked as context. A warning can no longer appear alone, so it can no
+ * longer read as a diagnosis.
+ */
+export function describeSpawnFailure(result: { exitCode: number | null; stdout: string; stderr: string }): string {
+  // A null exit code means the process was terminated by a signal rather than
+  // returning — the OOM-killer and an abort both land here. "exit code null"
+  // would read as a missing value; say what actually happened.
+  const parts = [
+    result.exitCode === null
+      ? "terminated by signal (no exit code — killed, not returned)"
+      : `exit code ${result.exitCode}`,
+  ];
+  const stdoutTail = result.stdout.trim().slice(-500);
+  if (stdoutTail) parts.push(`stdout tail: ${stdoutTail}`);
+  const stderrMsg = result.stderr.trim().slice(-500);
+  if (stderrMsg) parts.push(`stderr (context, not necessarily the cause): ${stderrMsg}`);
+  return parts.join(" | ");
+}
+
+/**
+ * Transcript destination for a phase run, mirroring the review phase's layout
+ * (`logs/review/<repo>-cycleN-<ts>.log`).
+ *
+ * Implement and revise kept no transcript at all, so a failed implementation was
+ * unanalysable the moment it ended — there was nothing to read back. That is why
+ * cycle 1519's real failure is gone for good.
+ */
+function phaseTranscriptPath(phase: string, repoName: string): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  return join(process.cwd(), "logs", phase, `${repoName}-${ts}.log`);
+}
 
 export interface RevisionResult {
   success: boolean;
   error?: string;
 }
+
+/** One parsed FOREMAN_REVIEW trailer line. */
+export interface ReviewTrailer {
+  pr: number;
+  verdict: string;
+  merged: boolean;
+  deploy: string;
+  /**
+   * Reason the reviewer DELIBERATELY withheld the issue's outcome label, from the
+   * optional `hold=` field. Undefined when the field is absent (every trailer
+   * written before this field existed) or when it says no/none/false.
+   *
+   * This exists to keep one honest case from being punished by the label
+   * reconciler: a reviewer that cannot yet judge an acceptance criterion (e.g. one
+   * that only becomes observable at a later time boundary) is RIGHT to leave the
+   * label alone, and must be able to say so. Without a way to declare it, a
+   * deliberate hold and a dropped label are the same observation, and automation
+   * has to guess — which means overwriting a correct judgment with a rubber stamp.
+   */
+  hold?: string;
+}
+
+export interface ReviewResult {
+  success: boolean;
+  error?: string;
+  // The skill's final summary text (parsed from the stream-json result event).
+  summary?: string;
+  // Concise per-PR status parsed from the FOREMAN_REVIEW trailer(s), including the
+  // deployment outcome — e.g. "#100 APPROVE · merged · deploy SUCCESS". Surfaced
+  // in the Foreman's Discord status line. Undefined if no trailer was emitted.
+  statusLine?: string;
+  // The same trailers, structured, so the orchestrator can check the run's
+  // post-condition (did the issues it claims to have merged actually advance?).
+  trailers?: ReviewTrailer[];
+}
+
+/**
+ * Parse the structured review trailers the skill is asked to emit, one per PR it
+ * acted on:
+ *   FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS
+ */
+export function parseReviewTrailerRecords(stdout: string): ReviewTrailer[] {
+  // Each field uses a bounded token alphabet ([\w/-]+) so it cannot bleed into
+  // surrounding characters when the trailer is emitted inside a single-line
+  // stream-JSON envelope (the Claude CLI's --output-format=stream-json), where
+  // the characters immediately after the trailer (`"}],"STOP_REASON":NULL,…`)
+  // are non-whitespace and would be greedily absorbed by an unbounded `\S+`.
+  // `hold=` is OPTIONAL and trails the original four fields, so every trailer
+  // written before it existed still matches with the group undefined. Do not
+  // reorder or make it required — the four-field form is the published contract.
+  const re = /FOREMAN_REVIEW\s+pr=#?(\d+)\s+verdict=([\w/-]+)\s+merged=([\w/-]+)\s+deploy=([\w/-]+)(?:\s+hold=([\w/-]+))?/gi;
+  const out: ReviewTrailer[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stdout)) !== null) {
+    const [, pr, verdict, merged, deploy, hold] = m;
+    const holding = hold !== undefined && !/^(0|n|no|none|false|off)$/i.test(hold);
+    out.push({
+      pr: Number(pr),
+      verdict: verdict.toUpperCase(),
+      merged: /^(y|yes|true)$/i.test(merged),
+      deploy: deploy.toUpperCase(),
+      ...(holding ? { hold } : {}),
+    });
+  }
+  return out;
+}
+
+/** Render parsed trailers as the concise Discord status line. */
+function formatReviewTrailers(trailers: ReviewTrailer[]): string | undefined {
+  if (trailers.length === 0) return undefined;
+  return trailers
+    .map((t) => {
+      const mergedTxt = t.merged ? "merged" : "not merged";
+      const deployTxt = /^(NA|N\/A|NONE)$/.test(t.deploy) ? "no deploy" : `deploy ${t.deploy}`;
+      const holdTxt = t.hold ? ` · HELD (${t.hold})` : "";
+      return `#${t.pr} ${t.verdict} · ${mergedTxt} · ${deployTxt}${holdTxt}`;
+    })
+    .join("; ");
+}
+
+/**
+ * The explicit "there was nothing to review" sentinel. Without it, a clean no-op
+ * and a session that died mid-review are the same observation — no trailer — and
+ * the trailer gate below would have to choose which one to assume. Making the
+ * no-op DECLARE itself lets the gate treat silence as the failure it usually is.
+ */
+const REVIEW_NOOP_SENTINEL = /FOREMAN_REVIEW\s+none\b/i;
 
 export interface ImplementationResult {
   success: boolean;
@@ -81,26 +220,80 @@ const IMAGE_HANDLING_INSTRUCTIONS = `IMAGE HANDLING: If an issue body or PR revi
 
 The Authorization header is required for private-repo URLs (github.com/.../raw/...) and harmless for public CDN URLs (github.com/user-attachments/...). If a fetch fails, log a warning and proceed with the text spec — do not abort the implementation.`;
 
-function spawnClaude(
+interface SpawnOptions {
+  /** Working directory for the claude process. */
+  cwd: string;
+  /** Value to inject as GH_TOKEN (controls GitHub account attribution). */
+  ghToken?: string;
+  model?: string;
+  allowedTools: string[];
+  maxTurns: number;
+  maxDurationMs: number;
+  /**
+   * Emit the full turn-by-turn interaction as newline-delimited JSON
+   * (`--output-format stream-json --verbose`) instead of just the final text.
+   * Used by the review phase so the transcript captures every tool call + result.
+   */
+  streamJson?: boolean;
+  /**
+   * When set, the raw stdout/stderr stream is appended to this file verbatim for
+   * post-hoc debugging. The directory is created if needed.
+   */
+  transcriptPath?: string;
+}
+
+/**
+ * Low-level Claude CLI spawn. All callers go through this so the timeout/abort/
+ * stream-capture behavior is shared. The per-call options carry cwd, token, and
+ * tool surface — implement/revise run in the service repo under the Foreman
+ * token; review runs in the EM repo under the EM token (see reviewOpenPRs).
+ */
+function spawnClaudeWithOptions(
   prompt: string,
-  config: RepoConfig,
+  opts: SpawnOptions,
   logger: Logger,
   abortSignal?: AbortSignal
 ): Promise<SpawnResult> {
   const args = [
     "--print",
     prompt,
-    "--max-turns", String(config.maxTurns),
+    "--max-turns", String(opts.maxTurns),
     "--dangerously-skip-permissions",
   ];
 
-  if (config.model) {
-    args.push("--model", config.model);
+  if (opts.streamJson) {
+    args.push("--output-format", "stream-json", "--verbose");
   }
 
-  if (config.allowedTools.length > 0) {
-    args.push("--allowedTools", config.allowedTools.join(","));
+  if (opts.model) {
+    args.push("--model", opts.model);
   }
+
+  if (opts.allowedTools.length > 0) {
+    args.push("--allowedTools", opts.allowedTools.join(","));
+  }
+
+  let transcript: WriteStream | null = null;
+  if (opts.transcriptPath) {
+    try {
+      mkdirSync(dirname(opts.transcriptPath), { recursive: true });
+      transcript = createWriteStream(opts.transcriptPath, { flags: "a" });
+      const argsForLog = args.map((a) => (a === prompt ? "<prompt>" : a));
+      transcript.write(
+        `# claude invocation @ ${new Date().toISOString()}\n` +
+        `# cwd=${opts.cwd}\n` +
+        `# args=${JSON.stringify(argsForLog)}\n` +
+        `# prompt:\n${prompt}\n\n===== STREAM =====\n`
+      );
+    } catch (err) {
+      logger.warn(`Failed to open transcript ${opts.transcriptPath}: ${err instanceof Error ? err.message : String(err)}`);
+      transcript = null;
+    }
+  }
+
+  // GH_TOKEN must be a string or absent — never literal "undefined".
+  const env: Record<string, string> = { ...process.env } as Record<string, string>;
+  if (opts.ghToken) env.GH_TOKEN = opts.ghToken;
 
   return new Promise<SpawnResult>((resolve) => {
     let stdout = "";
@@ -108,16 +301,25 @@ function spawnClaude(
     let child: ChildProcess | null = null;
     let timedOut = false;
 
+    const finish = (r: SpawnResult) => {
+      if (transcript) {
+        transcript.write(`\n===== END (exit=${r.exitCode}${r.timedOut ? ", timedOut" : ""}) @ ${new Date().toISOString()} =====\n`);
+        transcript.end();
+        transcript = null;
+      }
+      resolve(r);
+    };
+
     const timeout = setTimeout(() => {
       timedOut = true;
-      logger.warn(`Claude CLI timed out after ${config.maxDurationMs}ms`);
+      logger.warn(`Claude CLI timed out after ${opts.maxDurationMs}ms`);
       if (child) {
         child.kill("SIGTERM");
         setTimeout(() => {
           if (child && !child.killed) child.kill("SIGKILL");
         }, 10_000);
       }
-    }, config.maxDurationMs);
+    }, opts.maxDurationMs);
 
     const onAbort = () => {
       logger.warn("Claude CLI aborted");
@@ -128,18 +330,21 @@ function spawnClaude(
     }
 
     child = spawn("claude", args, {
-      cwd: config.repoPath,
-      env: { ...process.env, GH_TOKEN: process.env.FOREMAN_GITHUB_TOKEN } as Record<string, string>,
+      cwd: opts.cwd,
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
     child.stdout?.on("data", (data: Buffer) => {
       stdout += data.toString();
+      transcript?.write(data);
     });
 
     child.stderr?.on("data", (data: Buffer) => {
-      stderr += data.toString();
-      const lines = data.toString().split("\n").filter(Boolean);
+      const text = data.toString();
+      stderr += text;
+      transcript?.write(`[stderr] ${text}`);
+      const lines = text.split("\n").filter(Boolean);
       for (const line of lines) {
         logger.warn(`[claude stderr] ${line}`);
       }
@@ -148,16 +353,84 @@ function spawnClaude(
     child.on("error", (err) => {
       clearTimeout(timeout);
       if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr: err.message, exitCode: -1, timedOut: false });
+      finish({ stdout, stderr: err.message, exitCode: -1, timedOut: false });
     });
 
     child.on("close", (code) => {
       clearTimeout(timeout);
       if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
       child = null;
-      resolve({ stdout, stderr, exitCode: code, timedOut });
+      finish({ stdout, stderr, exitCode: code, timedOut });
     });
   });
+}
+
+/**
+ * Backward-compatible spawn for implement/revise: runs in the service repo under
+ * the Foreman token with the narrow tool set, final-text output, no transcript.
+ */
+function spawnClaude(
+  prompt: string,
+  config: RepoConfig,
+  logger: Logger,
+  abortSignal?: AbortSignal,
+  transcriptPath?: string
+): Promise<SpawnResult> {
+  return spawnClaudeWithOptions(
+    prompt,
+    {
+      cwd: config.repoPath,
+      ghToken: process.env.FOREMAN_GITHUB_TOKEN,
+      model: config.model,
+      allowedTools: config.allowedTools,
+      maxTurns: config.maxTurns,
+      maxDurationMs: config.maxDurationMs,
+      transcriptPath,
+    },
+    logger,
+    abortSignal
+  );
+}
+
+/** How much of a run's final summary is kept for logging and Discord display. */
+export const SUMMARY_DISPLAY_LIMIT = 2000;
+
+/**
+ * Parse the final `result` event from a stream-json transcript and return its
+ * text IN FULL. Undefined when no result event is present.
+ *
+ * This used to `.slice(0, 2000)` before returning, which silently destroyed the
+ * outcome it was feeding. The review prompt requires the FOREMAN_REVIEW trailer to
+ * be the last thing the agent emits, so on any review whose summary exceeds 2000
+ * characters the trailer sat past the cut. The caller then parsed the truncated
+ * string, found no trailer, and — because `summary` was non-null, so the
+ * `?? result.stdout` fallback never fired — recorded a complete, correct review as
+ * "ended without declaring an outcome".
+ *
+ * Worked example, slashbin-io-worker PR #589 (2026-08-05): full result text 3,672
+ * chars, trailer at index 3,571, present in the full text and absent from the
+ * truncated one. The agent had complied exactly; the harness threw the answer away
+ * and the run was booked as FAILED.
+ *
+ * The truncation is a DISPLAY concern and now belongs at the display sites
+ * (`SUMMARY_DISPLAY_LIMIT`), never between the agent's answer and the code that
+ * reads it. Note this failure was biased toward the reviews that did the most
+ * work: the longer and more thorough the write-up, the likelier its trailer fell
+ * past the cut.
+ */
+export function extractStreamResult(stdout: string): string | undefined {
+  const lines = stdout.split("\n").filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const evt = JSON.parse(lines[i]);
+      if (evt && evt.type === "result") {
+        return typeof evt.result === "string" ? evt.result : JSON.stringify(evt);
+      }
+    } catch {
+      // not a JSON line — keep scanning
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -212,16 +485,16 @@ Work autonomously. Do not ask questions.`;
     prompt += `\n\nIMPORTANT — PRIOR ATTEMPT FAILED: "${priorFailureReason}". Ensure you: (1) commit changes to the ${config.featureBranch} branch, (2) push to origin, (3) create a PR targeting ${config.baseBranch} using \`gh pr create\`. If a PR already exists, push new commits to it.`;
   }
 
-  const result = await spawnClaude(prompt, config, logger, abortSignal);
+  const transcriptPath = phaseTranscriptPath("implement", config.name);
+  logger.info(`Transcript: ${transcriptPath}`);
+  const result = await spawnClaude(prompt, config, logger, abortSignal, transcriptPath);
 
   if (result.timedOut) {
     return { success: false, error: "timed out" };
   }
 
   if (result.exitCode !== 0) {
-    const stderrMsg = result.stderr.trim();
-    const stdoutTail = result.stdout.trim().slice(-500);
-    const error = stderrMsg || stdoutTail || `exit code ${result.exitCode}`;
+    const error = describeSpawnFailure(result);
     logger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
   }
@@ -365,16 +638,16 @@ ${IMAGE_HANDLING_INSTRUCTIONS}
 Work autonomously. Do not ask questions.`;
   }
 
-  const result = await spawnClaude(prompt, config, logger, abortSignal);
+  const transcriptPath = phaseTranscriptPath("revise", config.name);
+  logger.info(`Transcript: ${transcriptPath}`);
+  const result = await spawnClaude(prompt, config, logger, abortSignal, transcriptPath);
 
   if (result.timedOut) {
     return { success: false, error: "timed out" };
   }
 
   if (result.exitCode !== 0) {
-    const stderrMsg = result.stderr.trim();
-    const stdoutTail = result.stdout.trim().slice(-500);
-    const error = stderrMsg || stdoutTail || `exit code ${result.exitCode}`;
+    const error = describeSpawnFailure(result);
     logger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
   }
@@ -400,4 +673,177 @@ Work autonomously. Do not ask questions.`;
 
   logger.info(`PR revision completed successfully for ${config.name}`);
   return { success: true };
+}
+
+/**
+ * Invoke the EM repo's /review-all-prs skill, scoped to a single service repo,
+ * in a headless Claude session.
+ *
+ * This is categorically different from implement/revise: those run IN the service
+ * repo under the Foreman token with a narrow tool set. Review is a decision-layer
+ * workflow — it needs the EM repo's MCP servers, npm scripts (healthcheck/verify/
+ * validate), and context/docs — so it runs with:
+ *   - cwd  = the EM repo (agentConfig.emRepoPath), so it loads the EM .mcp.json,
+ *            .claude/skills, and context/docs
+ *   - token = EM_GITHUB_TOKEN, so reviews/merges are attributed to the EM account
+ *             (memory: feedback_mcp_github_for_review_actions)
+ *   - the broad reviewAllowedTools surface (GitHub/Postgres/Redis/Railway MCP)
+ *
+ * Full-fidelity: the skill posts verdicts, merges approved PRs to develop, verifies
+ * dev, files S3/S4 follow-ups, and updates labels itself. The review's label side
+ * effects feed the existing phases: APPROVE → `pr approved` (awaiting the EM
+ * outcome-gate); REQUEST_CHANGES → `pr pending actions` (revise phase).
+ *
+ * The skill remains the PRIMARY labeler — it does things the orchestrator cannot
+ * (post the review body, file the follow-ups that belong with the verdict). But it
+ * is no longer the ONLY one: the orchestrator reconciles the outcome label from the
+ * returned trailers when the skill merged without labeling. See
+ * `reconcileReviewOutcomeLabels` in orchestrator.ts for why the write moved.
+ */
+export async function reviewOpenPRs(
+  repoConfig: RepoConfig,
+  agentConfig: AgentConfig,
+  logger: Logger,
+  abortSignal?: AbortSignal,
+  transcriptPath?: string,
+): Promise<ReviewResult> {
+  const emToken = process.env.EM_GITHUB_TOKEN;
+  if (!emToken) {
+    return { success: false, error: "EM_GITHUB_TOKEN not set — refusing to run review without EM-account attribution" };
+  }
+  if (!agentConfig.emRepoPath) {
+    return { success: false, error: "emRepoPath not configured — cannot locate the review skill" };
+  }
+
+  logger.info(`Starting review for ${repoConfig.name} (${repoConfig.githubRepo}) — cwd=${agentConfig.emRepoPath}`);
+
+  const prompt = `Read and follow the skill at ${agentConfig.reviewSkillPath}.
+
+Review the open feature PRs for the repository \`${repoConfig.githubRepo}\` ONLY. Treat this as the skill's repo-scoped mode (equivalent to \`--repo ${repoConfig.githubRepo}\`): scope every step — inventory, review, merge, verify — to that single repository, and use the full \`owner/repo\` slug \`${repoConfig.githubRepo}\` for all GitHub operations (do not rely on a short repo alias).
+
+Follow the skill exactly and act autonomously — do NOT ask questions or wait for confirmation:
+- Run the relevant healthchecks first (skill Phase 0).
+- Review each open \`features → develop\` PR (skill Phase 3): the Fix-Completeness gate first, then the rubric.
+- For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`pr approved\` per the skill. Do NOT apply \`ready for prod release\`, and do NOT remove it either — that label is the EM outcome-gate's signature (separation of duties; see /review-pr Step 17). If a linked issue already carries it, the EM has signed off ahead of you: leave that issue's labels alone entirely. Removing it silently blocks the promotion PR forever, so the Foreman now detects and restores it — but a restore is a repaired mistake, not a supported path.
+- For BLOCKED PRs: post REQUEST_CHANGES, label the linked issue \`pr pending actions\`, and file S3/S4 follow-up issues per the skill.
+- Update issue labels yourself exactly as the skill specifies. The orchestrator reconciles the outcome label from your trailer only when you left it unset — it never overrides a label you did set.
+
+CRITICAL — THIS IS A HEADLESS SESSION. THERE IS NO NEXT TURN.
+Ending your turn ends the process. Anything still running is killed at that instant, and everything you had not done yet never happens.
+
+- NEVER end your turn to "wait" for something. There is nothing to wait with. Do not say "I'll wait for X to land", "let me check back", or "proceeding once this completes" — those sentences are how a merged PR gets left with a mislabeled issue forever.
+- Run post-merge verification IN THE FOREGROUND and block on it. Do NOT launch it as a background task and yield — a backgrounded verify is killed the moment you stop, so its result never arrives and the labeling step after it never runs.
+- The merge is irreversible and the labeling is not automatic. Once you merge a PR you MUST, in the same turn, finish verification and set the issue's labels. If you cannot finish, say so explicitly in your final message rather than stopping quietly.
+- If a step genuinely cannot complete (verification times out, a deploy never settles), do NOT stall — record the outcome, label the issue \`pr pending actions\`, and emit the trailer with \`deploy=FAILURE\`. A reported failure is recoverable; silence is not.
+
+If there are no open feature PRs awaiting review for this repo, that is a clean no-op — say so and emit exactly \`FOREMAN_REVIEW none\` as your final line.
+
+IMPORTANT — status trailer: After you finish, end your output with one line per PR you acted on, in EXACTLY this format (nothing after the last one):
+
+FOREMAN_REVIEW pr=#<number> verdict=<APPROVE|REQUEST_CHANGES> merged=<yes|no> deploy=<SUCCESS|FAILURE|NA>
+
+Rules for the trailer: \`merged=yes\` only if you actually merged the PR to the base branch. \`deploy=SUCCESS\`/\`deploy=FAILURE\` reflects the post-merge deployment+verification result for that merge (use \`deploy=NA\` when nothing was merged, or when the repo has no deployment to verify, e.g. a docs/CLI/npm-package repo). Emit one trailer line for every PR you reviewed this run.
+
+OPTIONAL — deliberate hold: if you merged a PR but are INTENTIONALLY leaving the issue at \`pr under review\` (e.g. an acceptance criterion cannot be observed yet), append \`hold=<short-reason-slug>\` to that PR's trailer line:
+
+FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS hold=criterion-not-observable-until-0300z
+
+Use it ONLY for a decision you actually made. It tells the Foreman the label is missing ON PURPOSE, so it will neither auto-set the label nor auto-re-verify behind you — the issue stays visible as a held item instead of being reported as a failure. Omit the field entirely for the normal case; omitting it means "I finished the labeling."
+
+Note: the Foreman now reconciles the outcome label from this trailer as a BACKSTOP — if you merged and did not label, it applies the label your trailer implies. That is a safety net, not a substitute: still set the labels yourself per the skill, because only you can file the follow-ups and post the review body that go with them.
+
+The trailer is MANDATORY and is the last thing you emit. A run that ends without either a \`FOREMAN_REVIEW pr=…\` line or \`FOREMAN_REVIEW none\` is recorded as a FAILED review regardless of how much work you did, because from the outside it is indistinguishable from a session that died mid-merge.
+
+${IMAGE_HANDLING_INSTRUCTIONS}`;
+
+  const result = await spawnClaudeWithOptions(
+    prompt,
+    {
+      cwd: agentConfig.emRepoPath,
+      ghToken: emToken,
+      model: agentConfig.reviewModel,
+      allowedTools: agentConfig.reviewAllowedTools,
+      maxTurns: agentConfig.reviewMaxTurns,
+      maxDurationMs: agentConfig.reviewMaxDurationMs,
+      streamJson: true,
+      transcriptPath,
+    },
+    logger,
+    abortSignal
+  );
+
+  if (result.timedOut) {
+    return { success: false, error: "timed out" };
+  }
+
+  if (result.exitCode !== 0) {
+    const error = describeSpawnFailure(result);
+    logger.error(`Review Claude CLI exited with code ${result.exitCode}: ${error}`);
+    return { success: false, error };
+  }
+
+  // Parse from the FULL result text; truncate only for display. The trailer is
+  // required to be the LAST thing the agent emits, so parsing a length-capped
+  // copy discards exactly the part that carries the outcome.
+  const fullResult = extractStreamResult(result.stdout);
+  const summary = fullResult?.slice(0, SUMMARY_DISPLAY_LIMIT);
+
+  // Read the VERDICT out of the agent's final result text, not raw stdout.
+  // `result.stdout` is the stream-json transcript, and it opens with the prompt
+  // we just sent — which quotes the trailer format and the no-op sentinel
+  // verbatim. Scanning stdout for the sentinel therefore matches OUR OWN
+  // INSTRUCTIONS on every single run, silently declaring every dead session a
+  // clean no-op and disabling the gate below completely.
+  //
+  // The trailer regex survives stdout because the prompt's example is literally
+  // `pr=#<number>` and the pattern demands `\d+` — but that is a coincidence of
+  // the placeholder, not a guarantee. Prefer the result text; fall back to
+  // stdout only when no result event was emitted at all.
+  const trailers = parseReviewTrailerRecords(fullResult ?? result.stdout);
+  const declaredNoOp = fullResult ? REVIEW_NOOP_SENTINEL.test(fullResult) : false;
+  const statusLine = formatReviewTrailers(trailers);
+
+  // --- Trailer gate ------------------------------------------------------
+  // A clean exit says the PROCESS ended tidily. It says nothing about whether
+  // the REVIEW finished, and the two diverge in the one case that costs us: the
+  // agent merges the PR, then ends its turn before labeling. The session exits
+  // 0, we recorded success, reset the failure counter, and moved on — while the
+  // issue sat pinned at `pr under review` with its PR already merged, invisible
+  // to every phase (`findPRsNeedingReview` only matches OPEN PRs).
+  //
+  // Measured 2026-08-03 before this gate existed: 15 of 234 review runs (6.4%)
+  // emitted no trailer, 9 of them exiting 0 — i.e. silently booked as wins.
+  // slashbin-io-worker#564 is the worked example: merged PR #565 at 02:07Z,
+  // backgrounded its verification, ended its turn with "I'll wait for the
+  // verification run to land", and the harness killed the background tasks and
+  // exited 0.
+  //
+  // So: no trailer and no explicit no-op sentinel = FAILED, whatever the exit
+  // code claimed. This does not by itself repair anything — the merge already
+  // happened — but it converts a silent orphan into a logged, alerted failure,
+  // and the dead-zone recovery in the orchestrator takes it from there.
+  if (trailers.length === 0 && !declaredNoOp) {
+    logger.error(
+      `Review for ${repoConfig.name} exited 0 but emitted no FOREMAN_REVIEW trailer — outcome unknown; treating as FAILED${transcriptPath ? ` (transcript ${transcriptPath})` : ""}`,
+    );
+    return {
+      success: false,
+      error:
+        "no FOREMAN_REVIEW trailer emitted — the review session ended without declaring an outcome (likely stopped mid-run after merging); check the issue labels",
+      summary,
+      trailers,
+    };
+  }
+
+  if (summary) {
+    logger.info(`Review completed for ${repoConfig.name}:\n${summary}`);
+  } else {
+    logger.info(`Review completed for ${repoConfig.name} (no parseable summary; see transcript${transcriptPath ? ` ${transcriptPath}` : ""})`);
+  }
+  if (statusLine) {
+    logger.info(`Review outcome for ${repoConfig.name}: ${statusLine}`);
+  } else {
+    logger.info(`Review for ${repoConfig.name}: clean no-op (no PRs awaiting review)`);
+  }
+  return { success: true, summary, statusLine, trailers };
 }

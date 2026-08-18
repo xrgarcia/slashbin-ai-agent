@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import type { RepoConfig } from "./config.js";
 import type { Logger } from "./logger.js";
-import { gh, verifyPRExists } from "./github.js";
+import { gh, verifyPRExists, transitionImplementationLabels } from "./github.js";
 
 export interface ReconciliationResult {
   reconciled: boolean;
@@ -9,6 +9,27 @@ export interface ReconciliationResult {
   issueNumbers: number[];
   commitCount: number;
   error?: string;
+  /** Branches the reconciler refused to recreate a PR for — see `RejectedBranch`. */
+  rejected?: RejectedBranch[];
+}
+
+/**
+ * A feature branch carrying commits that were already rejected once.
+ *
+ * The reconciler's whole job is "commits are ahead of base with no open PR, so
+ * make one" — and that is right for orphaned work. It is exactly wrong when the
+ * missing PR is missing *because a human closed it unmerged*. Closing a PR is how
+ * the EM says no; recreating it says no wasn't heard.
+ */
+export interface RejectedBranch {
+  branch: string;
+  /** The closed-unmerged PR whose rejection still stands. */
+  prNumber: number;
+  prUrl: string;
+  /** Branch head — identical to the rejected PR's head, which is why this is a resurrection. */
+  headSha: string;
+  commitCount: number;
+  issueNumbers: number[];
 }
 
 interface OrphanedCommit {
@@ -23,6 +44,45 @@ function git(args: string[], cwd: string): string {
     stdio: ["pipe", "pipe", "pipe"],
     timeout: 30_000,
   }).trim();
+}
+
+/**
+ * What actually went wrong with a `git` child process.
+ *
+ * `err.message` alone is `Command failed: git fetch origin` — true, and useless.
+ * git puts the reason on stderr, which the helper captures and then nobody reads,
+ * so a broken remote, an auth failure and a killed process all produce the same
+ * sentence. Same defect class as the stderr-masking fixed in `ea60c9d`: a message
+ * that reads as a cause and isn't.
+ *
+ * `signal` matters more than it looks. git runs in the service cgroup, so when
+ * systemd stops the unit its SIGTERM reaches the child while the Foreman is still
+ * draining. The fetch didn't fail — it was cancelled — and reporting that as a
+ * WARN sent one investigation at the clone and the remote before the timestamps
+ * ruled both out.
+ */
+interface GitFailure {
+  error: string;
+  stderr?: string;
+  signal?: string;
+  /** Killed by a shutdown signal rather than failing on its own merits. */
+  cancelled: boolean;
+}
+
+function formatGitError(err: unknown): GitFailure {
+  const e = err as { message?: string; stderr?: unknown; signal?: string | null };
+  const stderr = typeof e?.stderr === "string"
+    ? e.stderr.trim()
+    : Buffer.isBuffer(e?.stderr)
+      ? e.stderr.toString("utf-8").trim()
+      : "";
+  const signal = e?.signal ?? undefined;
+  return {
+    error: e?.message ?? String(err),
+    ...(stderr ? { stderr } : {}),
+    ...(signal ? { signal } : {}),
+    cancelled: signal === "SIGTERM" || signal === "SIGINT",
+  };
 }
 
 export interface LocalBranchDivergence {
@@ -128,6 +188,52 @@ function hasOpenPR(
   }
 }
 
+/**
+ * The most recent CLOSED-UNMERGED PR for `featureBranch → baseBranch`, with the
+ * head SHA it was closed at.
+ *
+ * `hasOpenPR` deliberately only sees open PRs, which is what lets a rejection
+ * become invisible: the EM closes a PR unmerged, its commits stay on the shared
+ * branch, and one cycle later the reconciler finds "commits ahead, no open PR"
+ * and mints a fresh PR for the work that was just refused. Observed on
+ * jerky_data_receiver (#72 rejected → #74 recreated it, bundled with new work).
+ *
+ * Merged PRs are excluded on purpose — a merged PR is a completed delivery, not a
+ * refusal, and its commits being ahead of base again means something new happened.
+ */
+function findLastClosedUnmergedPR(
+  githubRepo: string,
+  featureBranch: string,
+  baseBranch: string,
+  cwd: string,
+): { number: number; url: string; headSha: string } | null {
+  try {
+    const json = gh([
+      "pr", "list",
+      "--repo", githubRepo,
+      "--head", featureBranch,
+      "--base", baseBranch,
+      "--state", "closed",
+      "--json", "number,url,mergedAt,headRefOid,closedAt",
+      "--limit", "20",
+    ], cwd);
+    const prs: {
+      number: number; url: string;
+      mergedAt: string | null; headRefOid: string; closedAt: string | null;
+    }[] = JSON.parse(json || "[]");
+    const unmerged = prs
+      .filter((p) => !p.mergedAt && p.headRefOid)
+      .sort((a, b) => String(b.closedAt ?? "").localeCompare(String(a.closedAt ?? "")));
+    if (unmerged.length === 0) return null;
+    const latest = unmerged[0];
+    return { number: latest.number, url: latest.url, headSha: latest.headRefOid };
+  } catch {
+    // Unknown, not "no rejection" — the caller treats null as "no guard available"
+    // and proceeds, which preserves the pre-guard behaviour on a gh failure.
+    return null;
+  }
+}
+
 function createReconciliationPR(
   config: RepoConfig,
   headBranch: string,
@@ -190,9 +296,16 @@ export function reconcileRepo(
   try {
     git(["fetch", "origin"], config.repoPath);
   } catch (err) {
-    logger.warn("git fetch failed, skipping reconciliation", {
-      error: err instanceof Error ? err.message : String(err),
-    });
+    const failure = formatGitError(err);
+    if (failure.cancelled) {
+      // Shutdown, not a fault. The next start reconciles this repo normally.
+      logger.info("Reconciliation cancelled — git fetch was interrupted by shutdown", {
+        repo: config.name,
+        signal: failure.signal,
+      });
+    } else {
+      logger.warn("git fetch failed, skipping reconciliation", { repo: config.name, ...failure });
+    }
     return { reconciled: false, issueNumbers: [], commitCount: 0 };
   }
 
@@ -201,6 +314,11 @@ export function reconcileRepo(
   if (featureBranches.length === 0) {
     return { reconciled: false, issueNumbers: [], commitCount: 0 };
   }
+
+  // Branches whose commits stand rejected. Collected rather than returned early:
+  // one repo can have several feature branches and a rejection on one must not stop
+  // legitimate reconciliation on another.
+  const rejected: RejectedBranch[] = [];
 
   // Check each feature branch for orphaned commits (commits ahead of base with no PR)
   for (const branch of featureBranches) {
@@ -230,6 +348,40 @@ export function reconcileRepo(
       continue;
     }
 
+    // Rejection guard: a PR is also "not open" when a human closed it unmerged.
+    // If the branch has not moved since that rejection, recreating the PR would
+    // re-propose the exact diff that was just refused.
+    const lastRejected = findLastClosedUnmergedPR(
+      config.githubRepo, branch, config.baseBranch, config.repoPath,
+    );
+    if (lastRejected) {
+      const headSha = commits[0].hash; // git log lists newest first
+      if (headSha === lastRejected.headSha) {
+        logger.warn(
+          `Not recreating a PR for ${branch} — its last PR (#${lastRejected.number}) was closed unmerged ` +
+          `and the branch has not moved since. The rejected commits are still ahead of ${config.baseBranch}.`,
+          { headSha, rejectedPR: lastRejected.url },
+        );
+        rejected.push({
+          branch,
+          prNumber: lastRejected.number,
+          prUrl: lastRejected.url,
+          headSha,
+          commitCount: commits.length,
+          issueNumbers: extractIssueNumbers(commits),
+        });
+        continue;
+      }
+      // Branch moved since the rejection: new work rides on top of rejected commits.
+      // Reconciling is still correct — someone must see the PR — but the bundle is
+      // not clean, and saying so is the difference between a review and a surprise.
+      logger.warn(
+        `${branch} has new commits on top of a rejected PR (#${lastRejected.number}). ` +
+        `The reconciliation PR will bundle both — the rejected diff has not been reverted.`,
+        { headSha: commits[0].hash, rejectedHead: lastRejected.headSha, rejectedPR: lastRejected.url },
+      );
+    }
+
     // Extract issue numbers and create a PR for this branch
     const issueNumbers = extractIssueNumbers(commits);
     logger.info(`Extracted issue numbers from ${branch}: ${issueNumbers.join(", ") || "none"}`);
@@ -252,8 +404,28 @@ export function reconcileRepo(
     }
 
     logger.info(`Reconciliation PR created and verified: ${prUrl}`);
-    return { reconciled: true, prUrl, issueNumbers, commitCount: commits.length };
+
+    // Apply `pr under review` to each linked issue. The implement phase normally
+    // does this after a successful PR open, but reconciler PRs are recovery for
+    // orphan commits left by an implementer that crashed (e.g. max-turns) before
+    // labeling — without this, the Review phase's gate (`findPRsNeedingReview`)
+    // never sees the PR and it sits dead-zoned indefinitely.
+    if (issueNumbers.length > 0) {
+      transitionImplementationLabels(
+        config.githubRepo,
+        issueNumbers,
+        config.repoPath,
+        logger,
+      );
+    }
+    return {
+      reconciled: true, prUrl, issueNumbers, commitCount: commits.length,
+      ...(rejected.length > 0 ? { rejected } : {}),
+    };
   }
 
-  return { reconciled: false, issueNumbers: [], commitCount: 0 };
+  return {
+    reconciled: false, issueNumbers: [], commitCount: 0,
+    ...(rejected.length > 0 ? { rejected } : {}),
+  };
 }
