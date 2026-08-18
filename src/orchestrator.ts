@@ -58,6 +58,12 @@ const activeRuns = new Map<string, AbortController>();
 const failureCount = new Map<string, number>();
 const failureHitMaxAt = new Map<string, number>(); // cycle when max was hit
 const revisionFailureCount = new Map<string, number>();
+// Repos whose revision retries are exhausted AND already escalated. Without this
+// the cap was reached silently: the count hit MAX_RETRIES, every later cycle took
+// the `debug` skip branch, and the stuck PR sat there with nobody told. The set is
+// cleared the moment a revision succeeds or the pending feedback clears, so a repo
+// that recovers escalates again if it breaks again.
+const revisionEscalated = new Set<string>();
 const reviewFailureCount = new Map<string, number>();
 const reviewFailureHitMaxAt = new Map<string, number>();
 
@@ -626,7 +632,7 @@ async function runRepoCycle(
   if (await tryReview(repoConfig, config, base, cycleNumber, events)) processed++;
 
   // --- Phase 2: Revise PRs with pending review feedback ---
-  const revisionInfo = await tryRevision(repoConfig, base, cycleNumber);
+  const revisionInfo = await tryRevision(repoConfig, base, cycleNumber, events);
   if (revisionInfo) {
     events.push({ message: `Revised ${repoConfig.githubRepo} PR #${revisionInfo.pr.number} (issues: ${revisionInfo.issueNumbers.map(n => `#${n}`).join(", ")})`, level: "info" });
     processed++;
@@ -1127,7 +1133,8 @@ async function tryBatchImplementation(
 async function tryRevision(
   repoConfig: RepoConfig,
   logger: Logger,
-  cycleNumber: number
+  cycleNumber: number,
+  events: CycleEvent[],
 ): Promise<PendingRevisionInfo | null> {
   const repoName = repoConfig.name;
   const revLogger = logger.child({ cycle: cycleNumber, repo: repoName, phase: "revision" });
@@ -1143,6 +1150,7 @@ async function tryRevision(
   const pending = findPendingRevisions(repoConfig, revLogger);
   if (!pending) {
     if (failures > 0) revisionFailureCount.set(repoName, 0);
+    revisionEscalated.delete(repoName);
     return null;
   }
 
@@ -1159,6 +1167,7 @@ async function tryRevision(
 
     if (result.success) {
       revisionFailureCount.set(repoName, 0);
+      revisionEscalated.delete(repoName);
 
       // Transition issue labels: "pr pending actions" → "pr under review"
       // The orchestrator owns this because the skill runs in the service repo
@@ -1176,6 +1185,26 @@ async function tryRevision(
       const newCount = failures + 1;
       revisionFailureCount.set(repoName, newCount);
       revLogger.warn(`PR revision failed (${newCount}/${MAX_RETRIES}): ${result.error}`);
+
+      // Retries exhausted. This is the end of the automated road for this PR: every
+      // later cycle takes the skip branch above and does nothing. Say so out loud,
+      // once, with the PR and the reason — a stuck PR that nobody is told about is
+      // only discovered by someone thinking to look.
+      if (newCount >= MAX_RETRIES && !revisionEscalated.has(repoName)) {
+        revisionEscalated.add(repoName);
+        const issues = pending.issueNumbers.map((n) => `#${n}`).join(", ");
+        revLogger.error(
+          `Revision retries exhausted on PR #${pending.pr.number} — no further attempts will be made ` +
+          `until the feedback clears or a revision succeeds.`,
+          { pr: pending.pr.number, issues: pending.issueNumbers, lastError: result.error },
+        );
+        events.push({
+          message:
+            `🛑 ${repoConfig.githubRepo} — PR #${pending.pr.number} failed revision ${newCount}x and the Foreman has ` +
+            `STOPPED retrying it${issues ? ` (issues ${issues})` : ""}. It needs a human. Last failure: ${result.error ?? "unknown"}`,
+          level: "error",
+        });
+      }
     }
 
     return null;
