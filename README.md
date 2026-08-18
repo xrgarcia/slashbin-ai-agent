@@ -28,17 +28,18 @@ The Foreman shines when you have **more approved work than time to implement**. 
 
 ## What the Foreman does
 
-Each poll cycle runs five phases across every configured repo:
+Each poll cycle runs six phases across every configured repo:
 
 ```
-Reconciliation → Revision → Implementation → Branch Sync → Promotion
+Reconciliation → Review → Revision → Implementation → Branch Sync → Promotion
 ```
 
 1. **Reconcile** — detects orphaned commits on the features branch with no PR and creates one
-2. **Revise** — finds PRs with pending review feedback and revises them (prioritized over new work)
-3. **Implement** — picks up approved issues and invokes the repo's implementation skill via Claude Code (up to 3 issues per cycle; 1 in greenfield repos)
-4. **Branch Sync** — merges main → develop to keep branches aligned after promotions
-5. **Promote** — creates promotion PRs (develop → main) for issues labeled `ready for prod release`
+2. **Review** *(opt-in)* — when `reviewEnabled` is set, invokes a review skill on open feature PRs awaiting review. The review skill runs in a **separate review repo** (`emRepoPath`) under a separate GitHub token, and owns its own merge + label decisions; its label side effects (approve → `pr approved`; request-changes → `pr pending actions`) feed the Promote and Revise phases, and the Foreman reconciles the outcome label from the run's trailer if the skill merged without setting it. Disabled by default — see [Review phase](#review-phase-opt-in)
+3. **Revise** — finds PRs with pending review feedback and revises them (prioritized over new work)
+4. **Implement** — picks up approved issues and invokes the repo's implementation skill via Claude Code (up to 3 issues per cycle; 1 in greenfield repos)
+5. **Branch Sync** — merges main → develop to keep branches aligned after promotions
+6. **Promote** — creates promotion PRs (develop → main) for issues labeled `ready for prod release`
 
 - **Poll interval is configurable** — default 5 minutes (`pollIntervalMs` in config)
 - **Multi-repo** — manages multiple repos in a single daemon, each with its own skill paths and config
@@ -114,6 +115,8 @@ For a single repo, set fields at the root level:
 | `githubRepo` | `AI_AGENT_GITHUB_REPO` | *(from git remote)* | GitHub `owner/repo` |
 | `triggerLabel` | `AI_AGENT_TRIGGER_LABEL` | `approved` | Label that triggers implementation |
 | `pollIntervalMs` | `AI_AGENT_POLL_INTERVAL_MS` | `300000` (5 min) | Poll interval in milliseconds |
+| `issueCacheTtlMs` | `AI_AGENT_ISSUE_CACHE_TTL_MS` | `30000` (30 s) | How long a repo's open-issue snapshot stays warm. Keep it **below** `pollIntervalMs`. `0` disables caching. See [GitHub API budget](#github-api-budget) |
+| `issueSnapshotLimit` | `AI_AGENT_ISSUE_SNAPSHOT_LIMIT` | `500` | Max open issues fetched per snapshot. Must exceed a repo's open-issue count; truncation is logged |
 | `skillPath` | `AI_AGENT_SKILL_PATH` | — | Claude Code skill for implementation |
 | `revisionSkillPath` | — | — | Claude Code skill for PR revision |
 | `prompt` | `AI_AGENT_PROMPT` | *(built-in)* | Custom prompt template |
@@ -121,9 +124,27 @@ For a single repo, set fields at the root level:
 | `featureBranch` | `AI_AGENT_FEATURE_BRANCH` | `features` | Branch to commit to |
 | `maxTurns` | `AI_AGENT_MAX_TURNS` | `30` | Max agent turns per issue |
 | `maxDurationMs` | `AI_AGENT_MAX_DURATION_MS` | `1800000` (30 min) | Max implementation time |
+| `model` | `AI_AGENT_MODEL` | CLI default | Model for implement/revise. Cascades to every repo that sets no `model` of its own |
 | `allowedTools` | — | `["Read","Write","Edit","Bash","Glob","Grep"]` | Tools the CLI can use |
 | `logFormat` | `AI_AGENT_LOG_FORMAT` | `text` | `json` or `text` |
 | `logLevel` | `AI_AGENT_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+
+### GitHub API budget
+
+Each poll cycle spends **one GraphQL request per repo** for issue discovery. GitHub's GraphQL limit is **5,000 requests/hour per token**, so the discovery floor is:
+
+```
+repos × (3600000 / pollIntervalMs)   requests/hour
+```
+
+The daemon logs this as `estDiscoveryGraphQlPerHour` on startup — check it against 5,000 after adding repos or lowering the poll interval. 20 repos at a 60 s interval is 1,200/hour; the same 20 repos would need an interval under ~15 s before discovery alone threatened the ceiling. Merges, reviews, and promotions spend additional requests on top, but only when there is work.
+
+This budget is why the discovery phases share **one open-issue snapshot per repo per cycle** rather than issuing a query per label. Before that change, six lookups each ran their own `gh issue list` — 20 repos on a 60 s interval came to ~7,200 requests/hour, which permanently exhausted the token and made roughly one lookup in six fail. A failed lookup silently skips that phase for that repo that cycle, so `approved` issues sat unimplemented with nothing but generic errors in the log.
+
+Two consequences worth knowing:
+
+- **Keep `issueCacheTtlMs` below `pollIntervalMs`**, or a cycle can be served entirely from the previous cycle's snapshot and an externally-applied `approved` label waits an extra cycle. The daemon warns at startup if you cross that line.
+- **Rate-limit rejections are logged as `[gh] RATE LIMIT EXHAUSTED`** and are deliberately not retried — the budget is already spent. If you see them, raise `pollIntervalMs` or reduce the repo count.
 
 ### Multi-repo mode
 
@@ -207,6 +228,103 @@ The Foreman delegates work by invoking Claude Code skills on each service repo. 
 
 The Foreman passes the issue context to Claude and instructs it to read and follow the skill. The skill defines the repo-specific implementation workflow — how to branch, test, and structure the PR.
 
+## Review phase (opt-in)
+
+The Review phase closes the loop between Implementation and Revision by invoking a
+**review skill** on open feature PRs awaiting review — automating the human/agent
+reviewer step. It is **disabled by default** (`reviewEnabled: false`); a vanilla
+config keeps the original five-phase behavior unchanged.
+
+It differs from Implementation/Revision in three ways, because review is a
+decision-layer workflow rather than an in-repo edit:
+
+- **Runs in a separate review repo.** The review skill is invoked with its working
+  directory set to `emRepoPath`, not the service repo — so it has the reviewer's own
+  tooling (MCP servers, verification scripts, context docs) available.
+- **Runs under a separate token.** Reviews and merges are attributed to the account
+  behind `EM_GITHUB_TOKEN` (distinct from `FOREMAN_GITHUB_TOKEN`), keeping the
+  reviewer identity separate from the implementer identity.
+- **Owns its own outcomes.** The skill posts the verdict, merges approved PRs, and
+  transitions issue labels itself. The label side effects feed the other phases:
+  approve → `pr approved` (awaiting the human release gate); request-changes →
+  `pr pending actions` (Revise). The Foreman reconciles the label as a backstop
+  when the skill merged without setting it — see below.
+
+### Outcome-label reconciliation
+
+The merge is performed by code, but the *record* of what the merge meant used to be
+left entirely to the review agent to remember to write. When a session ended after
+merging but before labeling, the issue stayed at `pr under review` with its PR
+already closed — invisible to every phase, since the review gate only matches OPEN
+PRs. Measured over one week on a 20-repo fleet: **12 of 53 merges (~23%) stranded
+their issue this way.**
+
+The outcome was never actually unknown — it arrives in the `FOREMAN_REVIEW` trailer
+the Foreman already parses. `reviewLabelReconcile` (default `true`) spends it: after
+a run reports a merge, any linked issue still sitting at `pr under review` is moved
+to the label its own trailer implies.
+
+Four conditions gate every write, so the reconciler can only ever repair a missing
+write — never invent one, never overrule anyone:
+
+1. the issue is still at `pr under review` with no outcome label (a skill that
+   labels correctly never reaches this code, so a healthy pipeline is unchanged);
+2. a **merged** PR provably closed that issue, under the strict closing-keyword
+   predicate (a bare "related to #N" never counts);
+3. that PR emitted a trailer this run whose fields are unambiguous;
+4. the reviewer did not declare a hold (below).
+
+It never applies `ready for prod release`. That label authorizes production and
+remains a human act.
+
+Set `reviewLabelReconcile: false` (or `AI_AGENT_REVIEW_LABEL_RECONCILE=false`) to
+keep labeling strictly agent-owned.
+
+### Declaring a deliberate hold
+
+A reviewer that merges but *intentionally* leaves the label unset — typically an
+acceptance criterion that cannot be observed yet — appends an optional `hold=` field
+to that PR's trailer:
+
+```
+FOREMAN_REVIEW pr=#100 verdict=APPROVE merged=yes deploy=SUCCESS hold=criterion-not-observable-until-0300z
+```
+
+The Foreman then neither sets the label nor re-verifies behind it, and surfaces the
+issue as *held* rather than failed. The hold is persisted in `.agent-state.json`, so
+it survives restarts, and clears automatically once the issue leaves the dead zone.
+
+Without this, a deliberate hold and a dropped label are the same observation, and
+automation has to guess — which means overwriting a correct judgment with a rubber
+stamp.
+
+The four-field trailer remains the contract: `hold=` is optional and trails the
+original fields, so trailers written before it existed parse identically.
+
+Every review run's full turn-by-turn interaction (`--output-format stream-json`) is
+written verbatim to `logs/review/<repo>-cycle<N>-<timestamp>.log` for debugging.
+
+A PR is gated into review only when its linked issue is labeled `pr under review`,
+it has an open `featureBranch → baseBranch` PR, and there is no review by
+`reviewerLogin` newer than the PR's latest commit (a freshness guard against
+re-review loops).
+
+Review config keys (all optional; global, with a per-repo `reviewEnabled` override):
+
+| Key | Default | Description |
+|---|---|---|
+| `reviewEnabled` | `false` | Enable the Review phase (per-repo override supported) |
+| `emRepoPath` | — | Working dir for the review skill (the review repo). Required when enabled |
+| `reviewSkillPath` | `.claude/skills/review-all-prs/SKILL.md` | Review skill, relative to `emRepoPath` |
+| `reviewModel` | — | Model override for review runs (independent of `model`) |
+| `reviewMaxTurns` | `200` | Max turns (review + verify is long-running) |
+| `reviewMaxDurationMs` | `3600000` (60 min) | Max review duration |
+| `reviewAllowedTools` | broad MCP + shell set | Tool surface for the review skill |
+| `reviewerLogin` | `slashbin-engineering-manager` | GitHub login the review runs as (freshness guard) |
+| `reviewLabelReconcile` | `true` | Set the outcome label from the run's own trailer when the skill merged without labeling. Env: `AI_AGENT_REVIEW_LABEL_RECONCILE` |
+
+Requires `EM_GITHUB_TOKEN` in the environment when enabled.
+
 ## Image handling in issue bodies
 
 Claude is multimodal — when an issue body or PR review comment contains markdown image references like `![alt](https://...)`, those images are part of the spec (mockups, screenshots, walkthrough frames). The Foreman appends instructions to its default and skill-driven prompts telling the agent to fetch each image to a temp file and `Read` it, so the model can see image content.
@@ -238,7 +356,7 @@ src/
 ├── github.ts          # GitHub API (polling, PRs, labels, dual-token ops)
 ├── agent.ts           # Claude Code CLI spawner
 ├── reviewer.ts        # PR review feedback handler
-├── orchestrator.ts    # 5-phase cycle, failure cooldowns, state tracking
+├── orchestrator.ts    # 6-phase cycle, failure cooldowns, state tracking
 ├── state.ts           # Persistent state management
 ├── daemon.ts          # Poll loop, graceful shutdown, Discord bridge
 ├── bridge-client.ts   # WebSocket client for Discord notifications

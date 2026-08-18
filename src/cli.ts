@@ -43,6 +43,8 @@ Environment variables:
   AI_AGENT_GITHUB_REPO      GitHub repo owner/name
   AI_AGENT_TRIGGER_LABEL    Trigger label (default: approved)
   AI_AGENT_POLL_INTERVAL_MS Poll interval in ms (default: 300000)
+  AI_AGENT_ISSUE_CACHE_TTL_MS   Open-issue snapshot TTL in ms (default: 30000; 0 disables)
+  AI_AGENT_ISSUE_SNAPSHOT_LIMIT Max open issues fetched per snapshot (default: 500)
   AI_AGENT_SKILL_PATH       Path to skill file
   AI_AGENT_BASE_BRANCH      PR target branch (default: develop)
   AI_AGENT_FEATURE_BRANCH   Commit branch (default: features)

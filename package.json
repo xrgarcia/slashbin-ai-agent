@@ -24,7 +24,8 @@
     "logs:repo": "node agent-manager.mjs logs --repo",
     "start:fg": "node dist/cli.js",
     "once": "node dist/cli.js --once",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=18"
