@@ -7,6 +7,7 @@ import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { startDaemon } from "./daemon.js";
 import { runCycle } from "./orchestrator.js";
+import { claimPidFile, releasePidFile } from "./pidfile.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -114,13 +115,32 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   } else {
-    // Daemon mode
+    // Daemon mode.
+    //
+    // Register the PID before starting any work. This is what makes `status`,
+    // `stop` and `restart` see a daemon no matter how it was launched, and it
+    // is the guard against a second daemon reviewing and merging the same PRs.
+    const claim = claimPidFile(repoFilter);
+    if (!claim.ok) {
+      logger.error(
+        `A daemon is already running for this scope (PID ${claim.pid}) — refusing to start a second. ` +
+        `Two agents would review and merge the same PRs. Stop that one first.`
+      );
+      process.exit(1);
+    }
+
     const daemon = startDaemon(config, logger, { configPath, repoFilter });
 
     const shutdown = async () => {
       await daemon.stop();
+      releasePidFile(claim.path);
       process.exit(0);
     };
+
+    // Covers the paths shutdown() never reaches (a plain return, process.exit
+    // elsewhere). Leaving a stale file behind is recoverable — claimPidFile
+    // takes over a dead PID — but cleaning up keeps `status` honest.
+    process.on("exit", () => releasePidFile(claim.path));
 
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);

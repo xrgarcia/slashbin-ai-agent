@@ -94,6 +94,15 @@ npm run once       # Run one poll cycle and exit
 npm run dev        # Watch mode (auto-reload on source changes)
 ```
 
+The daemon writes `.agent[-<repo>].pid` itself at startup, before it does any
+work — not just when launched via `npm start`. A daemon started any other way
+(`doppler run -- node dist/cli.js`, a detached shell, a supervisor) is therefore
+still visible to `status`, `stop` and `restart`.
+
+It also refuses to start when that PID file names a live process, so a second
+daemon cannot end up reviewing and merging the same PRs as the first. A stale
+file left by a killed daemon is taken over automatically.
+
 ## Configuration
 
 Copy `.ai-agent.example.json` to `.ai-agent.json` and customize. Env vars override file values.
