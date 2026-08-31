@@ -722,7 +722,7 @@ export async function reviewOpenPRs(
 Review the open feature PRs for the repository \`${repoConfig.githubRepo}\` ONLY. Treat this as the skill's repo-scoped mode (equivalent to \`--repo ${repoConfig.githubRepo}\`): scope every step — inventory, review, merge, verify — to that single repository, and use the full \`owner/repo\` slug \`${repoConfig.githubRepo}\` for all GitHub operations (do not rely on a short repo alias).
 
 Follow the skill exactly and act autonomously — do NOT ask questions or wait for confirmation:
-- Run the relevant healthchecks first (skill Phase 0).
+- Do NOT run healthchecks up front. A healthcheck verifies a deployment; a review that requests changes deploys nothing. Run them only in post-merge verification (skill Phase 5, via \`npm run verify\`), against a merge this run actually made.
 - Review each open \`features → develop\` PR (skill Phase 3): the Fix-Completeness gate first, then the rubric.
 - For APPROVED PRs: post the review from the EM account, merge to develop, then verify dev and label \`pr approved\` per the skill. Do NOT apply \`ready for prod release\`, and do NOT remove it either — that label is the EM outcome-gate's signature (separation of duties; see /review-pr Step 17). If a linked issue already carries it, the EM has signed off ahead of you: leave that issue's labels alone entirely. Removing it silently blocks the promotion PR forever, so the Foreman now detects and restores it — but a restore is a repaired mistake, not a supported path.
 - For BLOCKED PRs: post REQUEST_CHANGES, label the linked issue \`pr pending actions\`, and file S3/S4 follow-up issues per the skill.
