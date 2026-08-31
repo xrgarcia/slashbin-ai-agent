@@ -1,0 +1,54 @@
+# systemd user unit for the Foreman daemon.
+#
+#   cp deploy/slashbin-foreman.service.example ~/.config/systemd/user/slashbin-foreman.service
+#   # fill in the placeholders, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now slashbin-foreman
+#
+# The three settings under [Service] marked LOAD-BEARING are not style choices —
+# each one was a production incident. Do not "simplify" them away.
+
+[Unit]
+Description=SlashBin AI Foreman — polls approved issues, implements, reviews, promotes
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/slashbin-ai-foreman
+ExecStart=/usr/bin/doppler run --project <project> --config <config> -- /path/to/node dist/cli.js
+Restart=on-failure
+
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/<user>
+
+# The EM repo whose /review-all-prs skill the review phase runs. Point this at the
+# checkout that tracks your WORKING branch, not a promoted one: an acceptance
+# script committed to `develop` is invisible to a reviewer reading `main`, which
+# on 2026-08-31 had the Foreman report a committed script as never written and
+# spend a review cycle rewriting it.
+Environment=AI_AGENT_EM_REPO_PATH=/path/to/slashbin-engineering-manager
+
+# Optional Discord status bridge.
+#Environment=DISCORD_BRIDGE_URL=ws://127.0.0.1:9802
+#Environment=DISCORD_BOT_ID=<numeric id>
+#Environment=DISCORD_STATUS_CHANNEL=<numeric id>
+
+KillSignal=SIGTERM
+
+# LOAD-BEARING. `mixed` sends SIGTERM to the MainPID only. Under the systemd
+# default (control-group) that SIGTERM also reaches the `claude` child directly,
+# so the run the daemon is politely draining is already dead: on 2026-08-31 the
+# daemon logged a 3600s drain window at 11:59:18 and systemd logged Stopped one
+# second later, killing a review mid-flight. With `mixed`, only the daemon is
+# signalled; it drains its own children and systemd SIGKILLs the group only if
+# TimeoutStopSec elapses.
+KillMode=mixed
+
+# LOAD-BEARING. Must NOT undercut the daemon's own drain window, which is
+# max(repo maxDurationMs, reviewMaxDurationMs) — 60 min on the defaults. At the
+# old 1800 systemd SIGKILLed the group at 30 min while the daemon was still
+# draining a 60-minute review budget: the same mid-flight kill the drain fix
+# exists to prevent, reintroduced one layer up. Keep headroom above the budget.
+TimeoutStopSec=3900
+
+[Install]
+WantedBy=default.target
