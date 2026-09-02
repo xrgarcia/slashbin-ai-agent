@@ -190,11 +190,26 @@ export interface ImplementationResult {
 //  2. Free-text heuristic: the agent wrote about "skipping" or "no immediate
 //     code change". Less precise but catches well-behaved agents that explained
 //     themselves without using the structured trailer.
+/**
+ * The STRUCTURED trailer only — no free-text heuristic.
+ *
+ * This one is consulted BEFORE any PR detection, so it must never fire on an
+ * agent that merely talked about skipping while actually implementing. The
+ * trailer is a declaration; the heuristic in detectSkipSignal is a guess, and a
+ * guess does not get to pre-empt the evidence.
+ */
+function detectDeclaredSkip(stdout: string): { skipped: boolean; reason?: string } {
+  const structured = stdout.match(/FOREMAN_RESULT:\s*skipped(?:\s+reason="([^"]*)")?/i);
+  return structured
+    ? { skipped: true, reason: structured[1] || "no reason given" }
+    : { skipped: false };
+}
+
 function detectSkipSignal(stdout: string): { skipped: boolean; reason?: string } {
   // Structured trailer (preferred)
-  const structured = stdout.match(/FOREMAN_RESULT:\s*skipped(?:\s+reason="([^"]*)")?/i);
-  if (structured) {
-    return { skipped: true, reason: structured[1] || "no reason given" };
+  const declared = detectDeclaredSkip(stdout);
+  if (declared.skipped) {
+    return declared;
   }
 
   // Free-text heuristics on the last 2000 chars (agents tend to put the
@@ -468,6 +483,11 @@ export async function implementApprovedIssues(
 ): Promise<ImplementationResult> {
   logger.info(`Starting batch implementation for ${config.name}`);
 
+  // Captured so a DECLARED skip can be distinguished from a declaration made
+  // while the agent was in fact pushing work. Evidence beats narrative in both
+  // directions: the trailer is only honoured when the branch really did not move.
+  const beforeSha = getRemoteBranchSha(config.githubRepo, config.featureBranch, config.repoPath, logger);
+
   let prompt: string;
 
   if (config.skillPath) {
@@ -518,6 +538,43 @@ Work autonomously. Do not ask questions.`;
     const error = describeSpawnFailure(result);
     logger.error(`Claude CLI exited with code ${result.exitCode}: ${error}`);
     return { success: false, error };
+  }
+
+  // A DECLARED skip, with no new commits, is authoritative — and it has to be
+  // checked here, ahead of every PR heuristic below.
+  //
+  // Slashbin-console#841, 2026-09-02. The agent correctly refused to commit a
+  // chore onto `features` because an unrelated billing PR (#843) was already
+  // open on that branch and its skill forbids bundling the two. It emitted the
+  // trailer exactly as instructed. But an open PR on the branch existed, so the
+  // PR-detection below claimed it as this run's output and returned success —
+  // the skip check sat 30 lines further down and was never reached. Nothing was
+  // recorded, the back-off never armed, and the issue was re-queued every cycle:
+  // 41 full Claude sessions in six hours, each one reaching the same correct
+  // conclusion and having it discarded.
+  //
+  // The SHA guard is what makes this safe to check first. The prompt tells the
+  // agent not to emit the trailer when it created a PR, but "the agent followed
+  // the prompt" is exactly the assumption that should not be load-bearing — so
+  // a declaration is only honoured when the branch demonstrably did not move.
+  const declaredSkip = detectDeclaredSkip(result.stdout);
+  if (declaredSkip.skipped) {
+    const afterSha = getRemoteBranchSha(config.githubRepo, config.featureBranch, config.repoPath, logger);
+    if (beforeSha && afterSha && beforeSha !== afterSha) {
+      logger.warn(
+        `Agent emitted a skip trailer but ${config.featureBranch} advanced ` +
+        `${beforeSha.slice(0, 9)} → ${afterSha.slice(0, 9)} — treating the commits as the truth and ignoring the trailer`,
+      );
+    } else {
+      logger.info(`Implementation skipped by declaration — ${declaredSkip.reason}`);
+      return {
+        success: false,
+        skipped: true,
+        skipReason: declaredSkip.reason,
+        skippedIssues: issueNumbers ?? [],
+        error: `skipped: ${declaredSkip.reason}`,
+      };
+    }
   }
 
   // Extract PR URL from Claude's output
