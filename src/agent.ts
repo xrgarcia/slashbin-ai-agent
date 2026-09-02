@@ -58,7 +58,28 @@ function phaseTranscriptPath(phase: string, repoName: string): string {
 export interface RevisionResult {
   success: boolean;
   error?: string;
+  /**
+   * The revision deliberately made no commit and SAID SO via the
+   * FOREMAN_REVISION trailer. Distinct from a silent no-op, which stays a
+   * failure — see the SHA check in revisePRFeedback.
+   */
+  noCommit?: boolean;
+  /** The reason given on the trailer. Present only when `noCommit` is true. */
+  noCommitReason?: string;
 }
+
+/**
+ * A revision that correctly changes nothing must be able to say so.
+ *
+ * Structured trailer, not prose. `9ed3c02` in the EM repo is the same lesson
+ * from the review side: a gate that reads an agent's narrative instead of a
+ * declared field grades the wrong thing. The reason is required — a bare
+ * "no-commit" is indistinguishable from the silent no-op this guard exists to
+ * catch.
+ *
+ *   FOREMAN_REVISION no-commit reason=<why no code change was needed>
+ */
+const REVISION_NO_COMMIT = /FOREMAN_REVISION\s+no-commit\s+reason=(.+)/i;
 
 /** One parsed FOREMAN_REVIEW trailer line. */
 export interface ReviewTrailer {
@@ -618,10 +639,18 @@ export async function revisePRFeedback(
 
   const labelNote = `\n\nIMPORTANT: Do NOT update issue labels — the orchestrator handles label transitions after you finish.`;
 
+  // A review round can legitimately require no code change: the reviewer asked
+  // for none, the previous round already satisfied it, or the remaining work is
+  // on an issue body rather than the branch. Before this trailer existed, that
+  // outcome was indistinguishable from a silent no-op and was marked failed, so
+  // the labels never returned to "pr under review" and the PR could never be
+  // re-reviewed — Slashbin-console#843 sat in exactly that deadlock.
+  const noCommitNote = `\n\nIF NO CODE CHANGE IS NEEDED: do not invent one. Say so on its own line, as the LAST line of your output:\n\n  FOREMAN_REVISION no-commit reason=<one line: why the branch is already correct>\n\nWithout that trailer, a run that pushes nothing is treated as a failed revision — which is the correct default, because a silent no-op and a deliberate one look identical from outside.`;
+
   let prompt: string;
 
   if (config.revisionSkillPath) {
-    prompt = `Read and follow the skill at ${config.revisionSkillPath}.\n\nRevise PR #${prNumber || "(pending)"} which has review feedback for this repository. The skill defines the full workflow — follow it exactly.${prContext}${labelNote}\n\n${IMAGE_HANDLING_INSTRUCTIONS}`;
+    prompt = `Read and follow the skill at ${config.revisionSkillPath}.\n\nRevise PR #${prNumber || "(pending)"} which has review feedback for this repository. The skill defines the full workflow — follow it exactly.${prContext}${labelNote}${noCommitNote}\n\n${IMAGE_HANDLING_INSTRUCTIONS}`;
   } else {
     prompt = `Revise PR #${prNumber || "(find open PRs with review feedback)"} in this repository.
 
@@ -631,7 +660,7 @@ export async function revisePRFeedback(
 4. Run tests: npm test
 5. Commit fixes with message: fix: address review feedback (#${prNumber || "<number>"})
 6. Push to the PR branch.
-${prContext}${labelNote}
+${prContext}${labelNote}${noCommitNote}
 
 ${IMAGE_HANDLING_INSTRUCTIONS}
 
@@ -663,11 +692,25 @@ Work autonomously. Do not ask questions.`;
   // error), we trust the exit code rather than fail spuriously.
   const afterSha = getRemoteBranchSha(config.githubRepo, config.featureBranch, config.repoPath, logger);
   if (beforeSha && afterSha && beforeSha === afterSha) {
+    // Declared no-commit: the revision determined the branch is already correct
+    // and said so on the trailer. That is a real outcome, not a misfire, and it
+    // must return success — otherwise the orchestrator never transitions the
+    // labels back to "pr under review" and the PR is unreviewable forever.
+    const declared = REVISION_NO_COMMIT.exec(result.stdout);
+    if (declared) {
+      const reason = declared[1].trim().slice(0, 300);
+      logger.info(
+        `PR revision made no commit BY DECLARATION on ${config.featureBranch} ` +
+        `(SHA unchanged at ${beforeSha.slice(0, 10)}): ${reason}`,
+      );
+      return { success: true, noCommit: true, noCommitReason: reason };
+    }
+
     const outputTail = result.stdout.slice(-500).trim();
     if (outputTail) {
       logger.warn("Claude output (last 500 chars):\n" + outputTail);
     }
-    logger.error(`PR revision completed (exit 0) but no commits were pushed to ${config.featureBranch} (SHA unchanged at ${beforeSha.slice(0, 10)}) — marking as failed`);
+    logger.error(`PR revision completed (exit 0) but no commits were pushed to ${config.featureBranch} (SHA unchanged at ${beforeSha.slice(0, 10)}) and no FOREMAN_REVISION no-commit trailer was given — marking as failed`);
     return { success: false, error: "no commits pushed — revision was a no-op" };
   }
 

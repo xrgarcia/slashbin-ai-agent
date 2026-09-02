@@ -64,6 +64,17 @@ const revisionFailureCount = new Map<string, number>();
 // cleared the moment a revision succeeds or the pending feedback clears, so a repo
 // that recovers escalates again if it breaks again.
 const revisionEscalated = new Set<string>();
+// Consecutive revisions that pushed nothing BY DECLARATION, per repo.
+//
+// A declared no-commit is a valid answer, so it returns to "pr under review"
+// and gets re-reviewed. But if the reviewer then asks for the same change
+// again, the pair will ping-pong forever at no cost to either side and with
+// nothing changing. One is an answer; two in a row is a disagreement, and a
+// disagreement between two agents is a human's call.
+//
+// Cleared whenever a revision actually pushes, or the pending feedback clears.
+const consecutiveNoCommit = new Map<string, number>();
+const MAX_CONSECUTIVE_NO_COMMIT = 1;
 const reviewFailureCount = new Map<string, number>();
 const reviewFailureHitMaxAt = new Map<string, number>();
 
@@ -1151,6 +1162,7 @@ async function tryRevision(
   if (!pending) {
     if (failures > 0) revisionFailureCount.set(repoName, 0);
     revisionEscalated.delete(repoName);
+    consecutiveNoCommit.delete(repoName);
     return null;
   }
 
@@ -1168,6 +1180,38 @@ async function tryRevision(
     if (result.success) {
       revisionFailureCount.set(repoName, 0);
       revisionEscalated.delete(repoName);
+
+      if (result.noCommit) {
+        const seen = (consecutiveNoCommit.get(repoName) ?? 0) + 1;
+        consecutiveNoCommit.set(repoName, seen);
+
+        // Second one in a row: the reviewer keeps asking and the reviser keeps
+        // answering "already correct". Neither is going to move. Stop, and say
+        // who is stuck on what — a ping-pong nobody is told about looks exactly
+        // like an idle queue.
+        if (seen > MAX_CONSECUTIVE_NO_COMMIT) {
+          const issues = pending.issueNumbers.map((n) => `#${n}`).join(", ");
+          revLogger.error(
+            `PR #${pending.pr.number} has answered ${seen} review rounds in a row with no commit — ` +
+            `the reviewer and the reviser disagree and neither will move. Not re-labelling.`,
+            { pr: pending.pr.number, issues: pending.issueNumbers, reason: result.noCommitReason },
+          );
+          events.push({
+            message:
+              `🛑 ${repoConfig.githubRepo} — PR #${pending.pr.number} answered ${seen} review rounds with no code change` +
+              `${issues ? ` (issues ${issues})` : ""}. The reviewer asks, the reviser says the branch is already correct. ` +
+              `EM: rule on it. Last reason: ${result.noCommitReason ?? "not given"}`,
+            level: "error",
+          });
+          return null;
+        }
+
+        revLogger.info(
+          `PR #${pending.pr.number} revision made no commit by declaration — returning it to review: ${result.noCommitReason}`,
+        );
+      } else {
+        consecutiveNoCommit.delete(repoName);
+      }
 
       // Transition issue labels: "pr pending actions" → "pr under review"
       // The orchestrator owns this because the skill runs in the service repo
