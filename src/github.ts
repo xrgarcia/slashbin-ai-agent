@@ -2064,19 +2064,36 @@ export function tryMergeSyncPR(
  * merge.
  */
 /**
- * The branches a dependency PR may legitimately target, for one repo.
+ * The branches a dependency PR may be merged into MECHANICALLY, for one repo.
  *
- * Pure, exported and tested because it is the whole safety property of the
- * dependency phase: `main` must never appear in the result, however it got into
- * the config. Deduped so a main-only repo (feature === base) does not produce a
- * two-entry list of the same branch.
+ * Two branches are excluded, for opposite reasons.
+ *
+ * `main`, because a dependency update must never reach production without a dev
+ * deploy — the defect `jerky_shipping#237` closed on the producing side. That one
+ * is about where the change lands.
+ *
+ * `features`, because of who looks at it. This phase reads a CI check rollup and
+ * merges; no session runs, nothing is built, no server is started. The implement
+ * phase does all of that — it pulls the branch, builds, starts the app, verifies
+ * it responds, and reverts on a failed smoke test. A dependency bump on
+ * `features` is therefore WORK for that phase, and auto-merging it here would
+ * route the highest-risk class of change — a major version bump — around the one
+ * mechanism that would actually exercise it, and do it on the very branch the
+ * agent builds from. Refusing here is what leaves it to be picked up as work.
+ *
+ * (Owner decision, 2026-09-07. This function briefly accepted `features` earlier
+ * the same day; that was a branch-mechanics answer to a question about who
+ * exercises the code, and it inverted the intent.)
+ *
+ * Pure, exported and tested because these two exclusions are the whole safety
+ * property of the dependency phase.
  */
 export function dependencyMergeBases(
   featureBranch: string | undefined,
   baseBranch: string | undefined,
 ): string[] {
-  return [...new Set([featureBranch, baseBranch])]
-    .filter((b): b is string => !!b && b !== "main");
+  return [baseBranch]
+    .filter((b): b is string => !!b && b !== "main" && b !== featureBranch);
 }
 
 export function findDependencyPRs(

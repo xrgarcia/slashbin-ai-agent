@@ -1474,13 +1474,15 @@ function trySyncDrift(
  * close on the producing side. This is the consuming side — it only ever acts on
  * PRs already aimed at development.
  *
- * **Both `features` and `develop` are accepted (owner decision, 2026-09-07.)**
- * Dependabot is being retargeted from `develop` to `features` so a bump travels
- * `features → develop → main` like everything else; before that, every merge
- * into `develop` left `features` a commit further behind. The repos flip one at
- * a time, so this has to accept both for the duration — a single-branch filter
- * would strand every dependency PR on whichever side moved first, with nothing
- * logged, because a PR that does not match is simply not in the list.
+ * **`features` is deliberately NOT accepted (owner decision, 2026-09-07).**
+ * Dependabot is being retargeted from `develop` to `features` precisely so a
+ * version bump stops being merged by this phase and starts being picked up as
+ * WORK by the implement phase — which pulls the branch, builds, starts the app,
+ * verifies it responds and reverts on a failed smoke test. This phase does none
+ * of that; it reads a CI check rollup and merges. Accepting `features` here
+ * would route the highest-risk class of change around the only mechanism that
+ * exercises it, on the very branch the agent builds from. See
+ * `dependencyMergeBases`.
  *
  * Returns how many merged, so a quiet cycle stays quiet.
  */
