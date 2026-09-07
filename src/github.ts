@@ -2037,7 +2037,17 @@ export function tryMergeSyncPR(
 // --- Dependency PRs (Dependabot) ---
 
 /**
- * Open Dependabot PRs into `base`, and nothing else.
+ * Open Dependabot PRs into any of `bases`, and nothing else.
+ *
+ * **Why a list and not one branch (owner decision, 2026-09-07).** Dependabot is
+ * moving from `target-branch: develop` to `target-branch: features`, so that a
+ * dependency bump travels `features → develop → main` like every other change
+ * instead of landing on `develop` and leaving `features` behind. That retarget
+ * happens one repo at a time and cannot be simultaneous with this code change:
+ * whichever went first, every dependency PR in the gap would be invisible here
+ * and would sit unmerged with nothing logged. Accepting both branches for the
+ * duration is the additive half of that swap. Drop `develop` once no repo aims
+ * dependabot at it.
  *
  * Dependabot PRs never carry a linked issue, so the review phase cannot see
  * them: it is scoped to `features → develop` PRs and every step after the merge
@@ -2053,18 +2063,35 @@ export function tryMergeSyncPR(
  * branch means a mislabelled human PR can never be swept into an unreviewed
  * merge.
  */
+/**
+ * The branches a dependency PR may legitimately target, for one repo.
+ *
+ * Pure, exported and tested because it is the whole safety property of the
+ * dependency phase: `main` must never appear in the result, however it got into
+ * the config. Deduped so a main-only repo (feature === base) does not produce a
+ * two-entry list of the same branch.
+ */
+export function dependencyMergeBases(
+  featureBranch: string | undefined,
+  baseBranch: string | undefined,
+): string[] {
+  return [...new Set([featureBranch, baseBranch])]
+    .filter((b): b is string => !!b && b !== "main");
+}
+
 export function findDependencyPRs(
   repo: string,
   cwd: string,
-  base: string,
+  bases: readonly string[],
   logger?: Logger,
 ): PrSnapshot[] {
+  const allowed = new Set(bases);
   try {
     return getOpenPrs(repo, cwd).filter(
-      (p) => p.baseRefName === base && p.headRefName.startsWith("dependabot/"),
+      (p) => allowed.has(p.baseRefName) && p.headRefName.startsWith("dependabot/"),
     );
   } catch (err) {
-    logger?.warn("findDependencyPRs: gh pr list failed", { ...formatGhError(err), repo, base });
+    logger?.warn("findDependencyPRs: gh pr list failed", { ...formatGhError(err), repo, bases: [...allowed] });
     return [];
   }
 }
@@ -2089,6 +2116,7 @@ export function tryMergeDependencyPR(
   repo: string,
   prNumber: number,
   cwd: string,
+  allowedBases: readonly string[],
   logger?: Logger,
 ): boolean {
   interface CheckRun { status?: string; conclusion?: string; name?: string }
@@ -2107,10 +2135,22 @@ export function tryMergeDependencyPR(
   }
 
   // Re-assert both invariants against the PR itself rather than trusting the
-  // list that selected it. A base that is not the development branch is the one
+  // list that selected it. A base that is not a development branch is the one
   // outcome this must never produce.
+  //
+  // The base half used to be described here and never checked — the caller's
+  // filter was the only thing standing between a dependency bump and a merge
+  // straight to `main`. It is asserted now, so widening the caller to accept two
+  // branches cannot widen it to three.
   if (!view.headRefName?.startsWith("dependabot/")) {
     logger?.warn(`Dependency PR #${prNumber} is not a dependabot branch (${view.headRefName}) — refusing`);
+    return false;
+  }
+  const base = view.baseRefName ?? "";
+  if (base === "main" || !allowedBases.includes(base)) {
+    logger?.warn(
+      `Dependency PR #${prNumber} is based on "${base}", not one of ${allowedBases.join(", ")} — refusing`,
+    );
     return false;
   }
 

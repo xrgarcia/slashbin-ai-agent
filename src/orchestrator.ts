@@ -18,6 +18,7 @@ import {
   checkBranchDrift,
   findOpenSyncPR,
   createSyncPR,
+  dependencyMergeBases,
   findDependencyPRs,
   tryMergeDependencyPR,
   tryMergeSyncPR,
@@ -675,7 +676,11 @@ async function runRepoCycle(
     const merged = tryDependencyMerges(repoConfig, base, cycleNumber);
     if (merged > 0) {
       events.push({
-        message: `${repoConfig.githubRepo}: merged ${merged} dependency PR(s) into ${repoConfig.baseBranch}`,
+        // Deliberately does not name a branch: this phase now accepts both
+        // `features` and `develop`, so a fixed branch name here would be a
+        // claim the count cannot support. The per-PR line in
+        // `tryMergeDependencyPR` names the base it actually merged into.
+        message: `${repoConfig.githubRepo}: merged ${merged} dependency PR(s)`,
         level: "info",
       });
       processed++;
@@ -1461,13 +1466,21 @@ function trySyncDrift(
 }
 
 /**
- * Merge every green Dependabot PR into the repo's development branch.
+ * Merge every green Dependabot PR into the repo's feature or development branch.
  *
  * Guarded to `baseBranch !== "main"` by the caller, and again inside
  * `tryMergeDependencyPR`: a dependency update must never be merged straight to
  * a production branch, which is the exact defect `jerky_shipping#237` exists to
  * close on the producing side. This is the consuming side — it only ever acts on
  * PRs already aimed at development.
+ *
+ * **Both `features` and `develop` are accepted (owner decision, 2026-09-07.)**
+ * Dependabot is being retargeted from `develop` to `features` so a bump travels
+ * `features → develop → main` like everything else; before that, every merge
+ * into `develop` left `features` a commit further behind. The repos flip one at
+ * a time, so this has to accept both for the duration — a single-branch filter
+ * would strand every dependency PR on whichever side moved first, with nothing
+ * logged, because a PR that does not match is simply not in the list.
  *
  * Returns how many merged, so a quiet cycle stays quiet.
  */
@@ -1478,17 +1491,20 @@ function tryDependencyMerges(
 ): number {
   const depLogger = logger.child({ cycle: cycleNumber, repo: repoConfig.name, phase: "dependencies" });
 
+  const bases = dependencyMergeBases(repoConfig.featureBranch, repoConfig.baseBranch);
+  if (bases.length === 0) return 0;
+
   const prs = findDependencyPRs(
     repoConfig.githubRepo,
     repoConfig.repoPath,
-    repoConfig.baseBranch,
+    bases,
     depLogger,
   );
   if (prs.length === 0) return 0;
 
   let merged = 0;
   for (const pr of prs) {
-    if (tryMergeDependencyPR(repoConfig.githubRepo, pr.number, repoConfig.repoPath, depLogger)) {
+    if (tryMergeDependencyPR(repoConfig.githubRepo, pr.number, repoConfig.repoPath, bases, depLogger)) {
       depLogger.info(`Dependency PR merged — #${pr.number}: ${pr.title}`);
       merged++;
     }
