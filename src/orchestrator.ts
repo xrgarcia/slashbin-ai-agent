@@ -18,8 +18,12 @@ import {
   checkBranchDrift,
   findOpenSyncPR,
   createSyncPR,
+  buildDependencyBatchIssue,
+  createDependencyBatchIssue,
   dependencyMergeBases,
+  describeDependencyPR,
   findDependencyPRs,
+  findOpenDependencyBatchIssue,
   tryMergeDependencyPR,
   tryMergeSyncPR,
   countBranchDiffFiles,
@@ -681,6 +685,22 @@ async function runRepoCycle(
         // claim the count cannot support. The per-PR line in
         // `tryMergeDependencyPR` names the base it actually merged into.
         message: `${repoConfig.githubRepo}: merged ${merged} dependency PR(s)`,
+        level: "info",
+      });
+      processed++;
+    }
+  }
+
+  // --- Phase 4c: File ONE issue for the Dependabot PRs aimed at the feature
+  //    branch. Phase 4b deliberately refuses to merge those, so without this
+  //    they accumulate with no path forward at all. The issue puts them through
+  //    the implement session — which builds, boots the app and smoke-tests it —
+  //    instead of a CI rollup that only ever proved the code compiles. ---
+  if (repoConfig.baseBranch !== "main") {
+    const filed = tryFileDependencyBatchIssue(repoConfig, base, cycleNumber);
+    if (filed) {
+      events.push({
+        message: `${repoConfig.githubRepo}: filed dependency batch issue #${filed} — needs \`${repoConfig.triggerLabel}\` to build`,
         level: "info",
       });
       processed++;
@@ -1515,6 +1535,59 @@ function tryDependencyMerges(
     depLogger.debug(`${prs.length} dependency PR(s) open, none mergeable this cycle`);
   }
   return merged;
+}
+
+/**
+ * File ONE issue covering every Dependabot PR aimed at the feature branch.
+ *
+ * **Idempotent by construction: at most one open batch issue per repo.** Not by
+ * remembering what was filed — this runs every cycle across twenty repos and any
+ * state it kept in memory would be lost on the next restart, which is how a
+ * filing loop becomes twenty issues an hour. The check is a title-prefix match
+ * against the open-issue snapshot the cycle already fetched, so it is correct
+ * after a restart, correct if someone closes the issue by hand, and free.
+ *
+ * A PR that appears while a batch issue is open is not filed separately; it is
+ * picked up by the next batch once the current one closes. Bounded noise beats
+ * complete coverage here — the alternative is editing an issue body an agent may
+ * already be working from, which the issue-authoring rules forbid outright.
+ *
+ * Returns the new issue number, or null when there was nothing to file.
+ */
+function tryFileDependencyBatchIssue(
+  repoConfig: RepoConfig,
+  logger: Logger,
+  cycleNumber: number,
+): number | null {
+  const depLogger = logger.child({ cycle: cycleNumber, repo: repoConfig.name, phase: "dependencies" });
+  const featureBranch = repoConfig.featureBranch;
+  if (!featureBranch || featureBranch === "main" || featureBranch === repoConfig.baseBranch) return null;
+
+  const prs = findDependencyPRs(repoConfig.githubRepo, repoConfig.repoPath, [featureBranch], depLogger);
+  if (prs.length === 0) return null;
+
+  const existing = findOpenDependencyBatchIssue(repoConfig.githubRepo, repoConfig.repoPath, depLogger);
+  if (existing) {
+    depLogger.debug(
+      `${prs.length} dependency PR(s) on ${featureBranch}; batch issue #${existing.number} is already open`,
+    );
+    return null;
+  }
+
+  const changes = prs.map((p) => describeDependencyPR(p.number, p.title));
+  const { title, body } = buildDependencyBatchIssue(featureBranch, changes);
+  const number = createDependencyBatchIssue(
+    repoConfig.githubRepo, repoConfig.repoPath, title, body, depLogger,
+  );
+  if (number === null) return null;
+
+  const majors = changes.filter((c) => c.major).length;
+  depLogger.info(
+    `Filed dependency batch issue #${number} for ${prs.length} PR(s) on ${featureBranch}` +
+    (majors > 0 ? ` — ${majors} major` : "") +
+    ` — awaiting "${repoConfig.triggerLabel}"`,
+  );
+  return number;
 }
 
 function tryPromotion(

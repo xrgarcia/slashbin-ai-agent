@@ -2113,6 +2113,207 @@ export function findDependencyPRs(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Dependency BATCH issues — the path for bumps aimed at the feature branch
+// ---------------------------------------------------------------------------
+
+/**
+ * Every dependency-batch issue title starts with this, and that prefix is the
+ * whole idempotency mechanism: at most one open batch issue per repo, matched
+ * off the open-issue snapshot that is already fetched every cycle. No marker
+ * label to create on twenty repos, no extra API call, and nothing to drift.
+ */
+export const DEPENDENCY_BATCH_TITLE_PREFIX = "chore(deps): validate and land ";
+
+/** One dependency PR, reduced to what the issue body needs to say about it. */
+export interface DependencyChange {
+  number: number;
+  packages: string[];
+  from?: string;
+  to?: string;
+  /** True when the leading version component moves. `0.x` counts every minor. */
+  major: boolean;
+}
+
+/**
+ * Read a Dependabot PR title into packages and versions.
+ *
+ * Dependabot writes four shapes, all of them seen live on 2026-09-07:
+ *   `chore(deps): bump vite from 5.4.21 to 8.2.2`
+ *   `chore(deps-dev): bump react-dom and @types/react-dom in /desktop`
+ *   `chore(deps): bump qs and express`
+ *   `Bump form-data from 4.0.5 to 4.0.6`
+ *
+ * A grouped bump carries no versions in its title, so `from`/`to` stay undefined
+ * and `major` is false — deliberately understated rather than guessed. The issue
+ * body says to read the PR for those, because inventing a version here would put
+ * a wrong number in front of the person deciding whether to approve.
+ */
+export function describeDependencyPR(number: number, title: string): DependencyChange {
+  const versioned = /\bbump\s+(.+?)\s+from\s+(\S+)\s+to\s+(\S+)/i.exec(title);
+  if (versioned) {
+    return {
+      number,
+      packages: [versioned[1].trim()],
+      from: versioned[2],
+      to: versioned[3],
+      major: isMajorBump(versioned[2], versioned[3]),
+    };
+  }
+  const grouped = /\bbump\s+(.+?)(?:\s+in\s+\S+)?\s*$/i.exec(title);
+  const packages = grouped
+    ? grouped[1].split(/\s*,\s*|\s+and\s+/).map((p) => p.trim()).filter(Boolean)
+    : [];
+  return { number, packages, major: false };
+}
+
+/**
+ * Does this version move break compatibility by semver convention?
+ *
+ * `0.x` is the case that matters here and the one a naive major-compare gets
+ * wrong: under semver a `0.y` release may break on every minor, which is exactly
+ * how `esbuild` 0.25 → 0.28 behaves. Treating that as "not a major" would file
+ * a batch issue claiming a breaking upgrade is routine.
+ */
+export function isMajorBump(from: string, to: string): boolean {
+  const parse = (v: string) => v.replace(/^[^0-9]*/, "").split(".").map((n) => parseInt(n, 10));
+  const [fMaj, fMin] = parse(from);
+  const [tMaj, tMin] = parse(to);
+  if (!Number.isFinite(fMaj) || !Number.isFinite(tMaj)) return false;
+  if (fMaj !== tMaj) return true;
+  if (fMaj === 0) return Number.isFinite(fMin) && Number.isFinite(tMin) && fMin !== tMin;
+  return false;
+}
+
+/**
+ * The batch issue for a set of dependency PRs — title and body, pure.
+ *
+ * **Why an issue at all (owner decision, 2026-09-07).** Every stage after
+ * implement is keyed on an issue: the review phase starts from issues labelled
+ * `pr under review` and only then looks for the PR, promotion queries issues
+ * carrying the EM gate, and the promotion PR body is a list of issue numbers. A
+ * dependency PR with no issue can reach `develop` and then has no route to
+ * `main` at all. Filing one puts an upgrade through the same pipeline as every
+ * other change — including the implement session that actually builds it, starts
+ * the app and smoke-tests it, which is the step a CI-rollup merge never did.
+ *
+ * Filed WITHOUT the trigger label. The owner approves it like any other work;
+ * for a major bump that approval is the point.
+ */
+export function buildDependencyBatchIssue(
+  featureBranch: string,
+  changes: readonly DependencyChange[],
+): { title: string; body: string } {
+  const majors = changes.filter((c) => c.major);
+  const n = changes.length;
+  const title =
+    `${DEPENDENCY_BATCH_TITLE_PREFIX}${n} dependency update${n === 1 ? "" : "s"} on \`${featureBranch}\`` +
+    (majors.length > 0 ? ` (${majors.length} major)` : "");
+
+  const row = (c: DependencyChange) => {
+    const pkg = c.packages.length ? c.packages.join(", ") : "(see PR)";
+    const move = c.from && c.to ? `\`${c.from}\` → \`${c.to}\`` : "grouped — read the PR";
+    return `| #${c.number} | ${pkg} | ${move} | ${c.major ? "**yes**" : "no"} |`;
+  };
+
+  const body = [
+    `## Problem`,
+    ``,
+    `${n} Dependabot pull request${n === 1 ? "" : "s"} target \`${featureBranch}\` and ${n === 1 ? "is" : "are"} not merged.`,
+    `They do not reach \`develop\` on their own: a bump aimed at the feature branch has no`,
+    `mechanical merge path, because a CI check rollup proves the code compiles and never`,
+    `proves the application still runs.`,
+    ``,
+    majors.length > 0
+      ? `**${majors.length} of these ${majors.length === 1 ? "is a" : "are"} major version change${majors.length === 1 ? "" : "s"}.** A major bump is the class most likely to break a runtime while passing every check.`
+      : `None of these crosses a major version.`,
+    ``,
+    `| PR | Package(s) | Version | Major |`,
+    `|---|---|---|---|`,
+    ...changes.map(row),
+    ``,
+    `## Required Changes`,
+    ``,
+    `Land every PR above on \`${featureBranch}\`, or leave behind the ones that cannot be landed`,
+    `and say which and why. Merging them is not the work — **exercising them is**:`,
+    ``,
+    `1. Merge the branches into \`${featureBranch}\` locally.`,
+    `2. Install from the lockfile as the deploy does, not with a resolver flag that papers over a peer conflict.`,
+    `3. Build.`,
+    `4. **Start the application and confirm it serves.** A dependency upgrade that compiles and does not boot is the failure this issue exists to catch.`,
+    `5. Exercise the flows the changed packages sit under — a web framework means a real request through a real route; a date or validation library means the code paths that parse and format.`,
+    ``,
+    `If a PR fails any step, do not force it. Drop it from the batch, keep the rest, and record`,
+    `the failure and the step it failed at.`,
+    ``,
+    `## Acceptance`,
+    ``,
+    `- **No-Script:** the caller-facing surface of a dependency upgrade is the running application itself, and the evidence is the smoke test the implement session performs against it — build, boot, and a real request through the flows the changed packages sit under. A committed script would assert the lockfile, which is the half that already passes today.`,
+    ``,
+    `### Automated checks`,
+    ``,
+    `- The repo's build succeeds.`,
+    `- The repo's test suite passes.`,
+    `- The application starts and answers its health route.`,
+    ``,
+    `### Human validation`,
+    ``,
+    `- Confirm the PR names each landed package and its version, and names any PR dropped from the batch with the step it failed at.`,
+    ``,
+    `## Pre-Flight`,
+    ``,
+    `- **Design locked.** Land and exercise the listed PRs; drop and report the ones that fail. No open decision.`,
+    `- **Preconditions:** none. The PRs already exist and target \`${featureBranch}\`.`,
+    `- **Dev-safety: read-only, no customer writes.** A dependency upgrade changes no request handler, no worker and no outbound integration by itself. The smoke test exercises the app's own routes; it writes to no external system.`,
+    ``,
+    `## References`,
+    ``,
+    ...changes.map((c) => `- #${c.number}`),
+    ``,
+    `_Filed automatically by the Foreman: Dependabot PRs targeting \`${featureBranch}\` accumulate with no merge path until one of these exists._`,
+  ].join("\n");
+
+  return { title, body };
+}
+
+/**
+ * The open dependency-batch issue for a repo, if one exists.
+ *
+ * Reads the per-cycle open-issue snapshot rather than issuing its own query, so
+ * this costs nothing on the twenty-repo sweep.
+ */
+export function findOpenDependencyBatchIssue(
+  repo: string,
+  cwd: string,
+  logger: Logger,
+): IssueSnapshot | undefined {
+  return getOpenIssues(repo, cwd, logger)
+    .find((i) => i.title.startsWith(DEPENDENCY_BATCH_TITLE_PREFIX));
+}
+
+/**
+ * File one dependency-batch issue. Returns its number, or null if `gh` refused.
+ *
+ * No trigger label: capture is not approval (`CLAUDE.md`, "`approved` Is Flight,
+ * Not Filing"). The owner applies it.
+ */
+export function createDependencyBatchIssue(
+  repo: string,
+  cwd: string,
+  title: string,
+  body: string,
+  logger?: Logger,
+): number | null {
+  try {
+    const out = gh(["issue", "create", "--repo", repo, "--title", title, "--body", body], cwd);
+    const m = /\/issues\/(\d+)/.exec(out);
+    return m ? parseInt(m[1], 10) : null;
+  } catch (err) {
+    logger?.warn("createDependencyBatchIssue: gh issue create failed", { ...formatGhError(err), repo });
+    return null;
+  }
+}
+
 /**
  * Merge one Dependabot PR, but only once every check has CONCLUDED successfully.
  *
