@@ -2064,36 +2064,32 @@ export function tryMergeSyncPR(
  * merge.
  */
 /**
- * The branches a dependency PR may be merged into MECHANICALLY, for one repo.
+ * The branches a dependency PR may legitimately target, for one repo.
  *
- * Two branches are excluded, for opposite reasons.
+ * BOTH the feature branch and the base branch, because a dependency update is
+ * now work on either one and a mechanical merge on neither.
  *
- * `main`, because a dependency update must never reach production without a dev
- * deploy — the defect `jerky_shipping#237` closed on the producing side. That one
- * is about where the change lands.
+ * **This function used to be `dependencyMergeBases` and it named the branches a
+ * bump could be MERGED into without a session. That phase is gone.** Retargeting
+ * Dependabot at `features` only governs pull requests it opens from now on; on
+ * 2026-09-07 twenty-four of the twenty-eight already open were sitting on
+ * `develop`, where the merge phase would have swept them in on a green check
+ * rollup — no session, no build, no boot. Excluding `features` from a mechanical
+ * merge while leaving `develop` in it moved the defect one branch over rather
+ * than removing it.
  *
- * `features`, because of who looks at it. This phase reads a CI check rollup and
- * merges; no session runs, nothing is built, no server is started. The implement
- * phase does all of that — it pulls the branch, builds, starts the app, verifies
- * it responds, and reverts on a failed smoke test. A dependency bump on
- * `features` is therefore WORK for that phase, and auto-merging it here would
- * route the highest-risk class of change — a major version bump — around the one
- * mechanism that would actually exercise it, and do it on the very branch the
- * agent builds from. Refusing here is what leaves it to be picked up as work.
+ * `main` stays excluded outright: a dependency update must never be worked
+ * against the production branch, which is what `jerky_shipping#237` closed on
+ * the producing side.
  *
- * (Owner decision, 2026-09-07. This function briefly accepted `features` earlier
- * the same day; that was a branch-mechanics answer to a question about who
- * exercises the code, and it inverted the intent.)
- *
- * Pure, exported and tested because these two exclusions are the whole safety
- * property of the dependency phase.
+ * Pure, exported and tested because that exclusion is the safety property.
  */
-export function dependencyMergeBases(
+export function dependencyBatchBases(
   featureBranch: string | undefined,
   baseBranch: string | undefined,
 ): string[] {
-  return [baseBranch]
-    .filter((b): b is string => !!b && b !== "main" && b !== featureBranch);
+  return [...new Set([featureBranch, baseBranch])]
+    .filter((b): b is string => !!b && b !== "main");
 }
 
 export function findDependencyPRs(
@@ -2314,101 +2310,13 @@ export function createDependencyBatchIssue(
   }
 }
 
-/**
- * Merge one Dependabot PR, but only once every check has CONCLUDED successfully.
- *
- * Deliberately stricter than `tryMergeSyncPR`, which merges whatever branch
- * protection permits. A sync PR carries content that is already on `main` — it
- * has been reviewed and deployed. A dependency bump has been reviewed by nobody,
- * so the build and test suite are the entire review, and a merge while they are
- * still running would be a merge on no evidence at all.
- *
- * The gate therefore refuses on ANY check that is not a concluded success:
- * pending, queued, failed and cancelled all mean "not yet proven". `SKIPPED` and
- * `NEUTRAL` pass, because a skipped job made no claim either way.
- *
- * Returns false and stays quiet on anything unmergeable, so the caller can retry
- * every cycle without noise — the same idempotent-retry shape as the sync path.
+/*
+ * `tryMergeDependencyPR` lived here and merged a Dependabot PR whenever its
+ * check rollup was green. It was deleted on 2026-09-07: a rollup proves the code
+ * compiles and the unit tests pass, and never that the application still starts.
+ * Dependency updates now go through `buildDependencyBatchIssue` and the implement
+ * session, which builds and boots. Nothing merges a dependency PR without one.
  */
-export function tryMergeDependencyPR(
-  repo: string,
-  prNumber: number,
-  cwd: string,
-  allowedBases: readonly string[],
-  logger?: Logger,
-): boolean {
-  interface CheckRun { status?: string; conclusion?: string; name?: string }
-  let view: { mergeable?: string; baseRefName?: string; headRefName?: string; statusCheckRollup?: CheckRun[] };
-  try {
-    view = JSON.parse(
-      gh([
-        "pr", "view", String(prNumber),
-        "--repo", repo,
-        "--json", "mergeable,baseRefName,headRefName,statusCheckRollup",
-      ], cwd) || "{}",
-    );
-  } catch (err) {
-    logger?.debug(`Dependency PR #${prNumber}: could not read state: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
-
-  // Re-assert both invariants against the PR itself rather than trusting the
-  // list that selected it. A base that is not a development branch is the one
-  // outcome this must never produce.
-  //
-  // The base half used to be described here and never checked — the caller's
-  // filter was the only thing standing between a dependency bump and a merge
-  // straight to `main`. It is asserted now, so widening the caller to accept two
-  // branches cannot widen it to three.
-  if (!view.headRefName?.startsWith("dependabot/")) {
-    logger?.warn(`Dependency PR #${prNumber} is not a dependabot branch (${view.headRefName}) — refusing`);
-    return false;
-  }
-  const base = view.baseRefName ?? "";
-  if (base === "main" || !allowedBases.includes(base)) {
-    logger?.warn(
-      `Dependency PR #${prNumber} is based on "${base}", not one of ${allowedBases.join(", ")} — refusing`,
-    );
-    return false;
-  }
-
-  const checks = view.statusCheckRollup ?? [];
-  const unfinished = checks.filter((c) => (c.status ?? "").toUpperCase() !== "COMPLETED");
-  if (unfinished.length > 0) {
-    logger?.debug(`Dependency PR #${prNumber}: ${unfinished.length} check(s) still running`);
-    return false;
-  }
-  const passing = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
-  const failed = checks.filter((c) => !passing.has((c.conclusion ?? "").toUpperCase()));
-  if (failed.length > 0) {
-    logger?.info(
-      `Dependency PR #${prNumber} has failing check(s): ${failed.map((c) => `${c.name}=${c.conclusion}`).join(", ")} — leaving it open for a human`,
-    );
-    return false;
-  }
-  if (checks.length === 0) {
-    logger?.info(`Dependency PR #${prNumber} has no checks at all — refusing to merge on no evidence`);
-    return false;
-  }
-
-  try {
-    try {
-      ghAsEM([
-        "pr", "review", String(prNumber),
-        "--repo", repo,
-        "--approve",
-        "--body", `Automated dependency update — every check concluded successfully (${checks.length} check(s)). Merged to \`${view.baseRefName}\` by the Foreman; it reaches production only through the normal promotion gate.`,
-      ], cwd);
-    } catch {
-      // Already approved, or approval not required.
-    }
-    ghAsEM(["pr", "merge", String(prNumber), "--repo", repo, "--merge"], cwd);
-    return true;
-  } catch (err) {
-    logger?.debug(`Dependency PR #${prNumber} not mergeable yet: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
-}
 
 // --- PR Verification ---
 

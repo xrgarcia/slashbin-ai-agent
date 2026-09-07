@@ -20,11 +20,10 @@ import {
   createSyncPR,
   buildDependencyBatchIssue,
   createDependencyBatchIssue,
-  dependencyMergeBases,
+  dependencyBatchBases,
   describeDependencyPR,
   findDependencyPRs,
   findOpenDependencyBatchIssue,
-  tryMergeDependencyPR,
   tryMergeSyncPR,
   countBranchDiffFiles,
   stripReadyForProdLabel,
@@ -667,26 +666,6 @@ async function runRepoCycle(
   if (!(repoConfig.baseBranch === "main" && repoConfig.featureBranch === "main")) {
     if (trySyncDrift(repoConfig, base, cycleNumber)) {
       events.push({ message: `Branch sync on ${repoConfig.githubRepo} (main → develop) — merged`, level: "info" });
-      processed++;
-    }
-  }
-
-  // --- Phase 4b: Merge Dependabot PRs into the development branch once their
-  //    checks are green. They carry no linked issue, so the review phase cannot
-  //    see them and they accumulate against the base branch forever — 8 open
-  //    across the two jerky repos when this was added. Mechanical, like the sync
-  //    merge above: the build and test suite are the whole review. ---
-  if (repoConfig.baseBranch !== "main") {
-    const merged = tryDependencyMerges(repoConfig, base, cycleNumber);
-    if (merged > 0) {
-      events.push({
-        // Deliberately does not name a branch: this phase now accepts both
-        // `features` and `develop`, so a fixed branch name here would be a
-        // claim the count cannot support. The per-PR line in
-        // `tryMergeDependencyPR` names the base it actually merged into.
-        message: `${repoConfig.githubRepo}: merged ${merged} dependency PR(s)`,
-        level: "info",
-      });
       processed++;
     }
   }
@@ -1486,59 +1465,7 @@ function trySyncDrift(
 }
 
 /**
- * Merge every green Dependabot PR into the repo's feature or development branch.
- *
- * Guarded to `baseBranch !== "main"` by the caller, and again inside
- * `tryMergeDependencyPR`: a dependency update must never be merged straight to
- * a production branch, which is the exact defect `jerky_shipping#237` exists to
- * close on the producing side. This is the consuming side — it only ever acts on
- * PRs already aimed at development.
- *
- * **`features` is deliberately NOT accepted (owner decision, 2026-09-07).**
- * Dependabot is being retargeted from `develop` to `features` precisely so a
- * version bump stops being merged by this phase and starts being picked up as
- * WORK by the implement phase — which pulls the branch, builds, starts the app,
- * verifies it responds and reverts on a failed smoke test. This phase does none
- * of that; it reads a CI check rollup and merges. Accepting `features` here
- * would route the highest-risk class of change around the only mechanism that
- * exercises it, on the very branch the agent builds from. See
- * `dependencyMergeBases`.
- *
- * Returns how many merged, so a quiet cycle stays quiet.
- */
-function tryDependencyMerges(
-  repoConfig: RepoConfig,
-  logger: Logger,
-  cycleNumber: number,
-): number {
-  const depLogger = logger.child({ cycle: cycleNumber, repo: repoConfig.name, phase: "dependencies" });
-
-  const bases = dependencyMergeBases(repoConfig.featureBranch, repoConfig.baseBranch);
-  if (bases.length === 0) return 0;
-
-  const prs = findDependencyPRs(
-    repoConfig.githubRepo,
-    repoConfig.repoPath,
-    bases,
-    depLogger,
-  );
-  if (prs.length === 0) return 0;
-
-  let merged = 0;
-  for (const pr of prs) {
-    if (tryMergeDependencyPR(repoConfig.githubRepo, pr.number, repoConfig.repoPath, bases, depLogger)) {
-      depLogger.info(`Dependency PR merged — #${pr.number}: ${pr.title}`);
-      merged++;
-    }
-  }
-  if (merged === 0) {
-    depLogger.debug(`${prs.length} dependency PR(s) open, none mergeable this cycle`);
-  }
-  return merged;
-}
-
-/**
- * File ONE issue covering every Dependabot PR aimed at the feature branch.
+ * File ONE issue covering every open Dependabot PR on either working branch.
  *
  * **Idempotent by construction: at most one open batch issue per repo.** Not by
  * remembering what was filed — this runs every cycle across twenty repos and any
@@ -1560,16 +1487,17 @@ function tryFileDependencyBatchIssue(
   cycleNumber: number,
 ): number | null {
   const depLogger = logger.child({ cycle: cycleNumber, repo: repoConfig.name, phase: "dependencies" });
-  const featureBranch = repoConfig.featureBranch;
-  if (!featureBranch || featureBranch === "main" || featureBranch === repoConfig.baseBranch) return null;
+  const bases = dependencyBatchBases(repoConfig.featureBranch, repoConfig.baseBranch);
+  if (bases.length === 0) return null;
+  const featureBranch = repoConfig.featureBranch || bases[0];
 
-  const prs = findDependencyPRs(repoConfig.githubRepo, repoConfig.repoPath, [featureBranch], depLogger);
+  const prs = findDependencyPRs(repoConfig.githubRepo, repoConfig.repoPath, bases, depLogger);
   if (prs.length === 0) return null;
 
   const existing = findOpenDependencyBatchIssue(repoConfig.githubRepo, repoConfig.repoPath, depLogger);
   if (existing) {
     depLogger.debug(
-      `${prs.length} dependency PR(s) on ${featureBranch}; batch issue #${existing.number} is already open`,
+      `${prs.length} dependency PR(s) on ${bases.join("/")}; batch issue #${existing.number} is already open`,
     );
     return null;
   }
@@ -1583,7 +1511,7 @@ function tryFileDependencyBatchIssue(
 
   const majors = changes.filter((c) => c.major).length;
   depLogger.info(
-    `Filed dependency batch issue #${number} for ${prs.length} PR(s) on ${featureBranch}` +
+    `Filed dependency batch issue #${number} for ${prs.length} PR(s) on ${bases.join("/")}` +
     (majors > 0 ? ` — ${majors} major` : "") +
     ` — awaiting "${repoConfig.triggerLabel}"`,
   );
